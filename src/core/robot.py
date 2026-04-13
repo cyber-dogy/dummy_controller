@@ -71,6 +71,23 @@ class DummyRobot:
             with self.lock:
                 self.ser.write(b'!STOP\n')
     
+    @staticmethod
+    def _fix_j4_j6(angles: List[float]) -> List[float]:
+        """修正 J4 和 J6 的互换问题
+        用户输入: [J1, J2, J3, J4(小臂), J5, J6(末端)]
+        固件实际: [J1, J2, J3, J6(末端), J5, J4(小臂)]
+        """
+        fixed = angles.copy()
+        fixed[3], fixed[5] = angles[5], angles[3]
+        return fixed
+
+    @staticmethod
+    def _unfix_j4_j6(angles: List[float]) -> List[float]:
+        """从固件读数转回用户坐标系"""
+        fixed = angles.copy()
+        fixed[3], fixed[5] = angles[5], angles[3]
+        return fixed
+
     def get_position(self) -> Optional[List[float]]:
         """获取当前位置"""
         if not self.connected:
@@ -85,6 +102,7 @@ class DummyRobot:
             parts = response.strip().split()
             if len(parts) >= 7 and parts[0] == 'ok':
                 angles = [float(parts[i+1]) for i in range(6)]
+                angles = self._unfix_j4_j6(angles)
                 self.current_angles = angles
                 if self.on_position_update:
                     self.on_position_update(angles)
@@ -132,7 +150,8 @@ class DummyRobot:
                     print(f"  {v}")
         
         try:
-            cmd_str = f">{','.join(str(int(a)) for a in angles)},{speed}"
+            fixed_angles = self._fix_j4_j6(angles)
+            cmd_str = f">{','.join(str(int(a)) for a in fixed_angles)},{speed}"
             with self.lock:
                 self.ser.write((cmd_str + '\n').encode())
             

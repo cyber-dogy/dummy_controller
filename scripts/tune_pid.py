@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 一键在线调整 Dummy V2 关节 DCE PID 参数
-通过主控串口转发 CAN 命令到各关节驱动板
+通过串口向主控或各关节驱动板发送命令
 
 用法:
     python3 scripts/tune_pid.py /dev/ttyACM2
@@ -53,5 +53,5 @@ def tune_joints(port: str):
 
 
 if __name__ == "__main__":
-    port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
+    port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM2"
     tune_joints(port)

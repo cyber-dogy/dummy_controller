@@ -195,6 +195,30 @@ class DummyRobot:
             print(f"发送命令失败: {e}")
             return False
     
+    def set_dce_kp(self, joint: int, val: int) -> bool:
+        """设置指定关节的 DCE Kp"""
+        return self.send_command(f"#SET_DCE_KP {joint} {val}")
+    
+    def set_dce_ki(self, joint: int, val: int) -> bool:
+        """设置指定关节的 DCE Ki"""
+        return self.send_command(f"#SET_DCE_KI {joint} {val}")
+    
+    def set_dce_kd(self, joint: int, val: int) -> bool:
+        """设置指定关节的 DCE Kd"""
+        return self.send_command(f"#SET_DCE_KD {joint} {val}")
+    
+    def set_dce_kv(self, joint: int, val: int) -> bool:
+        """设置指定关节的 DCE Kv"""
+        return self.send_command(f"#SET_DCE_KV {joint} {val}")
+    
+    def reboot_joint(self, joint: int) -> bool:
+        """重启指定关节的电机驱动板"""
+        return self.send_command(f"#REBOOT {joint}")
+    
+    def reboot(self) -> bool:
+        """重启主控板"""
+        return self.send_command("!REBOOT")
+    
     def enter_teach_mode(self, current_limit: float = 1.5) -> bool:
         """
         进入示教模式（电流环模式）

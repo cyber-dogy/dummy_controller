@@ -175,9 +175,9 @@ class TeachDialog(QDialog):
         # 说明文字
         current_info = QLabel(
             "电流环模式：电机输出恒定电流，产生可预测的阻力\n"
-            "• 小电流(0.2-0.4A)：轻松拖动，适合快速示教\n"
-            "• 中电流(0.5-0.8A)：适度阻力，适合精确示教\n"
-            "• 大电流(1.0A+)：较重阻力，接近正常工作状态"
+            "• 小电流(0.5-1.0A)：轻松拖动，适合快速示教\n"
+            "• 中电流(1.0-1.8A)：适度阻力，适合精确示教（推荐 1.5A）\n"
+            "• 大电流(2.0A+)：较重阻力，接近正常工作状态"
         )
         current_info.setStyleSheet("color: #666; font-size: 10px;")
         current_group_layout.addWidget(current_info)
@@ -187,14 +187,14 @@ class TeachDialog(QDialog):
         current_layout.addWidget(QLabel("电流值:"))
         
         self.current_slider = QSlider(Qt.Orientation.Horizontal)
-        self.current_slider.setRange(1, 20)  # 0.1A ~ 2.0A
-        self.current_slider.setValue(5)  # 默认 0.5A
+        self.current_slider.setRange(1, 30)  # 0.1A ~ 3.0A
+        self.current_slider.setValue(15)  # 默认 1.5A
         self.current_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         current_layout.addWidget(self.current_slider)
         
         self.current_spin = QDoubleSpinBox()
-        self.current_spin.setRange(0.1, 2.0)
-        self.current_spin.setValue(0.5)
+        self.current_spin.setRange(0.1, 3.0)
+        self.current_spin.setValue(1.5)
         self.current_spin.setSingleStep(0.1)
         self.current_spin.setSuffix(" A")
         current_layout.addWidget(self.current_spin)
@@ -394,9 +394,13 @@ class TeachDialog(QDialog):
             QMessageBox.warning(self, "警告", "请先连接机器人！")
             return
         
+        # 未使能时自动使能
         if not self.robot.enabled:
-            QMessageBox.warning(self, "警告", "请先使能机器人！")
-            return
+            self.log("🔄 电机未使能，正在自动使能...")
+            if not self.robot.enable():
+                QMessageBox.critical(self, "错误", "自动使能失败，请检查电机状态！")
+                return
+            self.log("✅ 电机已自动使能")
         
         current = self.current_spin.value()
         
@@ -409,10 +413,10 @@ class TeachDialog(QDialog):
             
             self.log(f"🔓 已进入示教模式（电流: {current}A）")
             self.log("💡 现在你可以手动拖动机械臂了")
-            self.log("   提示：如果感觉太重，可以减小电流值")
+            self.log("   提示：如果感觉太重，可以减小电流值；太轻可增大电流值")
             
-            # 启动实时更新
-            self.update_timer.start(100)
+            # 启动实时更新（500ms 避免阻塞主线程）
+            self.update_timer.start(500)
         else:
             QMessageBox.critical(self, "错误", "进入示教模式失败！")
     
@@ -449,8 +453,8 @@ class TeachDialog(QDialog):
                 self, "位置超限",
                 f"当前位置有 {len(violations)} 个关节超出限位。\n"
                 f"是否平滑移动回合法位置后再退出？\n\n"
-                f"选择"是"：平滑过渡回边界点（推荐）\n"
-                f"选择"否"：直接退出（可能有抖动）",
+                f"选择'是'：平滑过渡回边界点（推荐）\n"
+                f"选择'否'：直接退出（可能有抖动）",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
             )
             
@@ -459,42 +463,15 @@ class TeachDialog(QDialog):
                 return
             
             if reply == QMessageBox.StandardButton.Yes:
-                # 先退出电流环模式，但保持电机使能
-                self.log("🔄 正在平滑回到合法位置...")
+                self.log("🔄 正在回到合法位置...")
                 
                 # 计算合法的目标位置（最近的边界点）
                 target_pos = JointLimitChecker.clamp_angles(current_pos)
                 
-                # 如果偏差较大，插入过渡点
-                max_diff = max(abs(c - t) for c, t in zip(current_pos, target_pos))
-                
-                if max_diff > 5:  # 如果偏差大于5度，平滑过渡
-                    self.log(f"   当前位置与边界点偏差 {max_diff:.1f}°，执行平滑过渡")
-                    
-                    # 生成过渡轨迹
-                    transition = JointLimitChecker.interpolate_to_limit(
-                        current_pos, target_pos, steps=10
-                    )
-                    
-                    # 需要先使能电机才能运动
-                    self.robot.enable()
-                    
-                    # 执行过渡运动（慢速）
-                    for i, angles in enumerate(transition):
-                        self.robot.move_to(angles, speed=10)  # 低速运动
-                        import time
-                        time.sleep(0.1)  # 等待运动完成
-                        
-                        if i % 3 == 0:  # 每3个点更新一次进度
-                            self.log(f"   过渡进度: {i+1}/{len(transition)}")
-                else:
-                    # 偏差小，直接运动到边界点
-                    self.robot.enable()
-                    self.robot.move_to(target_pos, speed=10)
-                    import time
-                    time.sleep(0.5)
-                
-                self.log(f"✅ 已回到合法位置: {target_pos}")
+                # 先使能电机，然后直接运动到边界点（避免在主线程 sleep 导致 GUI 卡住）
+                self.robot.enable()
+                self.robot.move_to(target_pos, speed=10)
+                self.log(f"✅ 已发送回边界指令: {target_pos}")
         
         # 完成退出
         self._finish_exit_teach_mode()

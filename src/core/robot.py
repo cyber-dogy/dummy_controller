@@ -77,8 +77,9 @@ class DummyRobot:
             return None
         try:
             with self.lock:
+                self.ser.reset_input_buffer()
                 self.ser.write(b'#GETJPOS\n')
-                time.sleep(0.3)
+                time.sleep(0.15)
                 response = self.ser.read(self.ser.in_waiting).decode()
             
             parts = response.strip().split()
@@ -194,18 +195,18 @@ class DummyRobot:
             print(f"发送命令失败: {e}")
             return False
     
-    def enter_teach_mode(self, current_limit: float = 0.5) -> bool:
+    def enter_teach_mode(self, current_limit: float = 1.5) -> bool:
         """
         进入示教模式（电流环模式）
         
-        通过发送 !TEACH <current> 命令，主控板会将所有关节切换到电流模式，
-        并设置指定的电流限制。电流越小，机械臂越容易拖动。
+        通过发送 !TEACH <current_mA> 命令，主控板会将所有关节切换到电流模式。
+        注意：固件通常接收整数单位的 mA，因此内部会将 A 转换为 mA。
         
         Args:
-            current_limit: 电流限制（A），推荐值 0.3~0.8
-                          0.3A = 非常轻，可轻松拖动
-                          0.5A = 适中，有轻微阻力
-                          0.8A = 较重，适合精确示教
+            current_limit: 电流限制（A），推荐值 1.0~2.5
+                          1.0A = 较轻，可轻松拖动
+                          1.5A = 适中（默认）
+                          2.5A = 较重，接近正常工作负载
         
         Returns:
             bool: 是否成功
@@ -213,19 +214,25 @@ class DummyRobot:
         if not self.connected:
             return False
         try:
-            # 发送示教模式命令（需要固件支持）
-            cmd = f"!TEACH {current_limit}"
+            # 固件通常期望 mA 整数（例如 1500 表示 1.5A）
+            current_mA = int(current_limit * 1000)
+            cmd = f"!TEACH {current_mA}"
             with self.lock:
+                self.ser.reset_input_buffer()
                 self.ser.write((cmd + '\n').encode())
-                time.sleep(0.2)
-                # 读取响应
-                response = self.ser.read(self.ser.in_waiting).decode()
+                time.sleep(0.3)
+                response = self.ser.read(self.ser.in_waiting).decode().strip()
+            
+            success = "Teach mode ON" in response or "OK" in response.upper() or response.startswith("ok")
+            if not success and not response:
+                # 部分固件不返回响应，认为成功
+                success = True
             
             self.enabled = False  # 示教模式下标记为未使能
-            return "Teach mode ON" in response or True  # 即使没收到响应也返回成功
+            return success
         except Exception as e:
             print(f"进入示教模式失败: {e}")
-            # 降级方案：直接禁用电机
+            # 降级方案：直接禁用电机（无助力但可拖动）
             try:
                 self.disable()
                 return True

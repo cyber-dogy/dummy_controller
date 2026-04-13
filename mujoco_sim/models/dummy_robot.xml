@@ -2,7 +2,7 @@
   <!-- MuJoCo 模型文件 for Dummy V2 机械臂 -->
   <!-- 基于任同学/木子晓汶版本的参数 -->
 
-  <compiler angle="degree" meshdir="../../4.Model/木子晓汶版本3D模型/" autolimits="true"/>
+  <compiler angle="degree" meshdir="../../../../4.Model/木子晓汶版本3D模型/" autolimits="true"/>
 
   <option timestep="0.005" iterations="50" tolerance="1e-10" solver="Newton" gravity="0 0 -9.81">
     <flag warmstart="enable"/>

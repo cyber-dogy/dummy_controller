@@ -20,8 +20,16 @@ from core.robot import DummyRobot
 from utils.config import JOINT_NAMES, JOINT_LIMITS, POSES
 
 # 尝试导入 MuJoCo
+import sys
+import os
+
+# 添加 mujoco_sim 到路径
+MUJOCO_SIM_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "mujoco_sim")
+if MUJOCO_SIM_PATH not in sys.path:
+    sys.path.insert(0, MUJOCO_SIM_PATH)
+
 try:
-    from mujoco_viewer.qt_integration import MuJoCoWidget, MujocoDialog
+    from src.qt_integration import MuJoCoWidget, MujocoDialog
     MUJOCO_AVAILABLE = True
 except ImportError as e:
     print(f"[警告] MuJoCo 未安装或初始化失败: {e}")

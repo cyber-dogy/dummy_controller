@@ -36,7 +36,7 @@ class DummyRobotVisualizer:
     - 支持目标位置预览（逆解）
     """
     
-    def __init__(self, model_path: str = "src/mujoco_viewer/dummy_robot.xml"):
+    def __init__(self, model_path: str = None):
         """
         初始化可视化器
         
@@ -68,6 +68,14 @@ class DummyRobotVisualizer:
     def _init_model(self) -> bool:
         """初始化 MuJoCo 模型"""
         try:
+            import os
+            if self.model_path is None:
+                self.model_path = os.path.join(
+                    os.path.dirname(__file__),
+                    "..", "models", "dummy_robot.xml"
+                )
+                self.model_path = os.path.abspath(self.model_path)
+            
             self.model = mujoco.MjModel.from_xml_path(self.model_path)
             self.data = mujoco.MjData(self.model)
             
@@ -322,7 +330,12 @@ class MujocoWidget:
     def _init_model(self):
         """初始化模型"""
         try:
-            model_path = "src/mujoco_viewer/dummy_robot.xml"
+            import os
+            model_path = os.path.join(
+                os.path.dirname(__file__),
+                "..", "models", "dummy_robot.xml"
+            )
+            model_path = os.path.abspath(model_path)
             self.model = mujoco.MjModel.from_xml_path(model_path)
             self.data = mujoco.MjData(self.model)
             self.renderer = mujoco.Renderer(self.model, self.height, self.width)

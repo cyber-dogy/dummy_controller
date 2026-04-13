@@ -84,8 +84,9 @@ class MuJoCoWidget(QWidget):
             import os
             model_path = os.path.join(
                 os.path.dirname(__file__), 
-                "dummy_robot.xml"
+                "..", "models", "dummy_robot.xml"
             )
+            model_path = os.path.abspath(model_path)
             
             self.model = mujoco.MjModel.from_xml_path(model_path)
             self.data = mujoco.MjData(self.model)

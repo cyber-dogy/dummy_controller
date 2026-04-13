@@ -302,6 +302,28 @@ class MainWindowWithMuJoCo(QMainWindow):
         
         right_layout.addWidget(teach_group)
         
+        # FK/IK 测试
+        if MUJOCO_AVAILABLE:
+            ik_group = QGroupBox("🔬 FK/IK 测试")
+            ik_layout = QVBoxLayout(ik_group)
+            
+            ik_btn = QPushButton("🧮 逆解测试")
+            ik_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #607D8B;
+                    color: white;
+                    padding: 10px;
+                }
+            """)
+            ik_btn.clicked.connect(self._open_ik_dialog)
+            ik_layout.addWidget(ik_btn)
+            
+            ik_info = QLabel("• 输入目标位置\n• MuJoCo 计算 IK\n• 验证正解精度")
+            ik_info.setStyleSheet("color: #666; font-size: 10px;")
+            ik_layout.addWidget(ik_info)
+            
+            right_layout.addWidget(ik_group)
+        
         # MuJoCo 独立窗口按钮
         if MUJOCO_AVAILABLE:
             mujoco_btn = QPushButton("🔳 打开独立 MuJoCo 窗口")
@@ -370,11 +392,17 @@ class MainWindowWithMuJoCo(QMainWindow):
         )
     
     def _update_mujoco(self):
-        """更新 MuJoCo 显示"""
-        if self.mujoco_widget and self.robot.connected:
-            # 获取当前位置
+        """更新 MuJoCo 显示（联动实际机械臂和仿真）"""
+        if self.robot.connected:
             angles = self.robot.current_angles
-            self.mujoco_widget.update_joint_angles(angles)
+            
+            # 更新主界面的 MuJoCo 组件
+            if self.mujoco_widget:
+                self.mujoco_widget.update_joint_angles(angles)
+            
+            # 更新独立 MuJoCo 窗口
+            if self.mujoco_dialog and self.mujoco_dialog.isVisible():
+                self.mujoco_dialog.update_angles(angles)
     
     def _open_mujoco_dialog(self):
         """打开独立 MuJoCo 窗口"""
@@ -547,6 +575,14 @@ class MainWindowWithMuJoCo(QMainWindow):
         
         dialog = TeachDialog(self.robot, self)
         dialog.exec()
+    
+    def _open_ik_dialog(self):
+        """打开逆解测试对话框"""
+        from gui.ik_dialog import IKDialog
+        
+        dialog = IKDialog(self.robot, self)
+        dialog.exec()
+        self._log("打开逆解测试对话框")
     
     def closeEvent(self, event):
         """关闭事件"""

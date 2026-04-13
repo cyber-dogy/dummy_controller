@@ -172,6 +172,7 @@ class DummyRobotVisualizer:
         """
         with self.lock:
             self.current_state = RobotState(joint_angles.copy())
+            self._apply_joint_angles(joint_angles.copy())
     
     def set_target(self, joint_angles: List[float]):
         """

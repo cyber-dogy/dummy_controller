@@ -52,3 +52,4 @@ temp/
 
 # MuJoCo
 MUJOCO_LOG.TXT
+mujoco_sim/.venv_mujoco/

@@ -93,22 +93,18 @@ class DummyRobotVisualizer:
     
     def _apply_joint_angles(self, angles_deg: List[float]):
         """
-        应用关节角度到模型
-        
-        Args:
-            angles_deg: 6个关节角度（度）
+        应用关节角度到模型（通过 jnt_qposadr 安全赋值，不假设 qpos 下标连续）
         """
         if self.data is None:
             return
-        
-        # 转换到弧度
-        angles_rad = np.deg2rad(angles_deg)
-        
-        # 设置关节位置
-        for i, angle in enumerate(angles_rad):
-            self.data.qpos[i] = angle
-        
-        # 前向运动学计算
+
+        joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        for i, (name, deg) in enumerate(zip(joint_names, angles_deg)):
+            jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            if jnt_id >= 0:
+                adr = self.model.jnt_qposadr[jnt_id]
+                self.data.qpos[adr] = np.deg2rad(deg)
+
         mujoco.mj_forward(self.model, self.data)
     
     def start(self) -> bool:
@@ -238,72 +234,108 @@ class DummyRobotVisualizer:
             np.rad2deg(roll), np.rad2deg(pitch), np.rad2deg(yaw)
         ]
     
-    def inverse_kinematics(self, target_pos: List[float], 
+    def inverse_kinematics(self, target_pos: List[float],
                           target_quat: Optional[List[float]] = None,
-                          initial_guess: Optional[List[float]] = None) -> Optional[List[float]]:
+                          initial_guess: Optional[List[float]] = None,
+                          pos_tol: float = 1e-3,
+                          ori_weight: float = 0.1) -> Optional[List[float]]:
         """
-        数值逆解（使用 MuJoCo 的优化求解器）
-        
+        数值逆解（多起点 L-BFGS-B，同时约束位置+姿态）
+
         Args:
-            target_pos: 目标位置 [x, y, z]（米）
-            target_quat: 目标四元数 [w, x, y, z]（可选）
-            initial_guess: 初始猜测角度（度）
-        
+            target_pos:   目标位置 [x, y, z]（米）
+            target_quat:  目标四元数 [w, x, y, z]（可选，不传则只约束位置）
+            initial_guess:外部提供的初始猜测（度）；内部还会额外生成随机起点
+            pos_tol:      允许的最大位置误差（米），超过则返回 None
+            ori_weight:   姿态误差在目标函数中的权重（相对位置误差）
+
         Returns:
             6个关节角度（度），失败返回 None
         """
         if self.data is None or self.model is None:
             return None
-        
-        # 保存当前状态
+
         qpos_backup = self.data.qpos.copy()
-        
+
+        # 关节限位（弧度）—— J6 限制在 ±360° 避免优化器漫游
+        bounds = [
+            (np.deg2rad(-170), np.deg2rad(170)),  # J1
+            (np.deg2rad(-75),  np.deg2rad(0)),    # J2
+            (np.deg2rad(35),   np.deg2rad(180)),  # J3
+            (np.deg2rad(-170), np.deg2rad(170)),  # J4
+            (np.deg2rad(-120), np.deg2rad(120)),  # J5
+            (np.deg2rad(-360), np.deg2rad(360)),  # J6（缩小避免漫游）
+        ]
+
+        target_pos_arr = np.array(target_pos, dtype=float)
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "end_effector")
+        joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+
+        def _set_q(q_rad):
+            for i, name in enumerate(joint_names):
+                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                if jid >= 0:
+                    self.data.qpos[self.model.jnt_qposadr[jid]] = q_rad[i]
+            mujoco.mj_forward(self.model, self.data)
+
+        def objective(q):
+            _set_q(q)
+            # 位置误差
+            pos_err = np.sum((self.data.site_xpos[site_id] - target_pos_arr) ** 2)
+            # 姿态误差（如果提供了目标四元数）
+            ori_err = 0.0
+            if target_quat is not None:
+                # 当前末端四元数
+                mat = self.data.site_xmat[site_id].reshape(3, 3)
+                cur_quat = np.zeros(4)
+                mujoco.mju_mat2Quat(cur_quat, mat.flatten())
+                tgt = np.array(target_quat, dtype=float)
+                tgt /= np.linalg.norm(tgt)
+                # 四元数距离：1 - |q1·q2|
+                ori_err = 1.0 - abs(np.dot(cur_quat, tgt))
+            return pos_err + ori_weight * ori_err
+
+        # 构建起点列表：用户提供 + L-Pose + REST + 多个随机
+        candidates = []
+        if initial_guess is not None:
+            candidates.append(np.deg2rad(initial_guess))
+        candidates.append(np.deg2rad([0, 0, 90, 0, 0, 0]))    # L-Pose
+        candidates.append(np.deg2rad([0, -75, 180, 0, 0, 0]))  # REST
+        rng = np.random.default_rng(42)
+        for _ in range(5):
+            rand_q = np.array([
+                rng.uniform(lo, hi) for lo, hi in bounds
+            ])
+            candidates.append(rand_q)
+
+        best_result = None
+        best_pos_err = float('inf')
+
         try:
-            # 设置初始猜测
-            if initial_guess is not None:
-                self._apply_joint_angles(initial_guess)
-            
-            # 创建目标位姿
-            target = np.array(target_pos)
-            
-            # 使用 MuJoCo 的 IK（简化版本，使用最小化距离）
-            # 这里使用简单的优化方法
             from scipy.optimize import minimize
-            
-            def objective(q):
-                self.data.qpos[:6] = q
-                mujoco.mj_forward(self.model, self.data)
-                site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "end_effector")
-                current_pos = self.data.site_xpos[site_id]
-                return np.sum((current_pos - target)**2)
-            
-            # 初始值
-            q0 = self.data.qpos[:6].copy() if initial_guess is None else np.deg2rad(initial_guess)
-            
-            # 关节限位
-            bounds = [
-                (np.deg2rad(-170), np.deg2rad(170)),  # J1
-                (np.deg2rad(-75), np.deg2rad(0)),     # J2
-                (np.deg2rad(35), np.deg2rad(180)),    # J3
-                (np.deg2rad(-170), np.deg2rad(170)),  # J4
-                (np.deg2rad(-120), np.deg2rad(120)),  # J5
-                (np.deg2rad(-720), np.deg2rad(720)),  # J6
-            ]
-            
-            # 优化
-            result = minimize(objective, q0, method='L-BFGS-B', bounds=bounds)
-            
-            if result.success:
-                solution = np.rad2deg(result.x)
-                return solution.tolist()
+
+            for q0 in candidates:
+                res = minimize(objective, q0, method='L-BFGS-B', bounds=bounds,
+                               options={'maxiter': 300, 'ftol': 1e-12, 'gtol': 1e-8})
+                # 检查实际位置误差（不信任 result.success）
+                _set_q(res.x)
+                pos_err = np.linalg.norm(self.data.site_xpos[site_id] - target_pos_arr)
+                if pos_err < best_pos_err:
+                    best_pos_err = pos_err
+                    best_result = res.x.copy()
+                if pos_err < pos_tol:
+                    break  # 已经足够精确，不需要继续尝试
+
+            if best_result is not None and best_pos_err <= pos_tol:
+                return np.rad2deg(best_result).tolist()
             else:
+                print(f"[MuJoCo] IK 求解失败，最小位置误差 {best_pos_err*1000:.2f}mm > {pos_tol*1000:.1f}mm")
                 return None
-                
+
         except Exception as e:
-            print(f"[MuJoCo] IK 求解失败: {e}")
+            print(f"[MuJoCo] IK 异常: {e}")
             return None
         finally:
-            # 恢复状态
             self.data.qpos[:] = qpos_backup
             mujoco.mj_forward(self.model, self.data)
     

@@ -71,23 +71,6 @@ class DummyRobot:
             with self.lock:
                 self.ser.write(b'!STOP\n')
     
-    @staticmethod
-    def _fix_j4_j6(angles: List[float]) -> List[float]:
-        """修正 J4 和 J6 的互换问题
-        用户输入: [J1, J2, J3, J4(小臂), J5, J6(末端)]
-        固件实际: [J1, J2, J3, J6(末端), J5, J4(小臂)]
-        """
-        fixed = angles.copy()
-        fixed[3], fixed[5] = angles[5], angles[3]
-        return fixed
-
-    @staticmethod
-    def _unfix_j4_j6(angles: List[float]) -> List[float]:
-        """从固件读数转回用户坐标系"""
-        fixed = angles.copy()
-        fixed[3], fixed[5] = angles[5], angles[3]
-        return fixed
-
     def get_position(self) -> Optional[List[float]]:
         """获取当前位置"""
         if not self.connected:
@@ -102,7 +85,6 @@ class DummyRobot:
             parts = response.strip().split()
             if len(parts) >= 7 and parts[0] == 'ok':
                 angles = [float(parts[i+1]) for i in range(6)]
-                angles = self._unfix_j4_j6(angles)
                 self.current_angles = angles
                 if self.on_position_update:
                     self.on_position_update(angles)
@@ -150,8 +132,8 @@ class DummyRobot:
                     print(f"  {v}")
         
         try:
-            fixed_angles = self._fix_j4_j6(angles)
-            cmd_str = f">{','.join(str(int(a)) for a in fixed_angles)},{speed}"
+            cmd_str = f">{','.join(str(int(a)) for a in angles)},{speed}"
+            print(f"[DEBUG] move_to: {cmd_str}")  # 调试用
             with self.lock:
                 self.ser.write((cmd_str + '\n').encode())
             
@@ -240,66 +222,46 @@ class DummyRobot:
     
     def enter_teach_mode(self, current_limit: float = 1.5) -> bool:
         """
-        进入示教模式（电流环模式）
-        
-        通过发送 !TEACH <current_mA> 命令，主控板会将所有关节切换到电流模式。
-        注意：固件通常接收整数单位的 mA，因此内部会将 A 转换为 mA。
-        
-        Args:
-            current_limit: 电流限制（A），推荐值 1.0~2.5
-                          1.0A = 较轻，可轻松拖动
-                          1.5A = 适中（默认）
-                          2.5A = 较重，接近正常工作负载
-        
-        Returns:
-            bool: 是否成功
+        进入示教模式：发送 !DISABLE，停止位置控制（MODE_STOP）。
+        步进电机降低 Kp 无效（驱动芯片仍施加保持电流），必须完全禁用才能拖动。
+        剩余阻力仅为减速器机械摩擦，与断电拖动手感一致。
         """
         if not self.connected:
             return False
         try:
-            # 固件通常期望 mA 整数（例如 1500 表示 1.5A）
-            current_mA = int(current_limit * 1000)
-            cmd = f"!TEACH {current_mA}"
             with self.lock:
-                self.ser.reset_input_buffer()
-                self.ser.write((cmd + '\n').encode())
+                self.ser.write(b'!DISABLE\n')
                 time.sleep(0.3)
-                response = self.ser.read(self.ser.in_waiting).decode().strip()
-            
-            success = "Teach mode ON" in response or "OK" in response.upper() or response.startswith("ok")
-            if not success and not response:
-                # 部分固件不返回响应，认为成功
-                success = True
-            
-            self.enabled = False  # 示教模式下标记为未使能
-            return success
+                self.ser.read(self.ser.in_waiting)
+            self.enabled = False
+            return True
         except Exception as e:
             print(f"进入示教模式失败: {e}")
-            # 降级方案：直接禁用电机（无助力但可拖动）
-            try:
-                self.disable()
-                return True
-            except:
-                return False
-    
+            return False
+
     def exit_teach_mode(self) -> bool:
         """
-        退出示教模式，恢复位置控制
-        
-        发送 !TEACHOFF 命令，主控板会将当前位置设为目标位置并保持。
+        退出示教模式：读当前位置 → !START 使能 → 立即保持当前位置。
+        必须先保位，否则电机上电会猛地回到上次记忆的目标位置。
         """
         if not self.connected:
             return False
         try:
-            # 发送退出示教模式命令
+            # 1. 在禁用状态下读当前位置（编码器仍有效）
+            current_pos = self.get_position()
+
+            # 2. 使能电机
             with self.lock:
-                self.ser.write(b'!TEACHOFF\n')
-                time.sleep(0.2)
+                self.ser.write(b'!START\n')
+                time.sleep(0.3)
                 self.ser.read(self.ser.in_waiting)
-            
             self.enabled = True
+
+            # 3. 立即保持当前位置，防止突然跳位
+            if current_pos:
+                self.move_to(current_pos, speed=10, check_limits=False)
+
             return True
         except Exception as e:
             print(f"退出示教模式失败: {e}")
-            # 降级方案：直接使能
-            return self.enable()
+            return False

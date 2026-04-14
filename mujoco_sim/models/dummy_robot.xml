@@ -1,76 +1,118 @@
 <mujoco model="dummy_v2">
-  <!-- MuJoCo 模型文件 for Dummy V2 机械臂 -->
-  <!-- 基于任同学/木子晓汶版本的参数 -->
+  <!-- MuJoCo MJCF — 基于 URDF dummy2.urdf 转换 -->
+  <!-- 网格来源: _repos/dummy2/simulation/dummy2/meshes/ -->
 
-  <compiler angle="degree" meshdir="../../../../4.Model/木子晓汶版本3D模型/" autolimits="true"/>
+  <compiler angle="radian"
+            meshdir="../../../../_repos/dummy2/simulation/dummy2/meshes/"
+            autolimits="true"/>
 
-  <option timestep="0.005" iterations="50" tolerance="1e-10" solver="Newton" gravity="0 0 -9.81">
-    <flag warmstart="enable"/>
-  </option>
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <option timestep="0.005" gravity="0 0 -9.81"/>
 
   <default>
-    <joint armature="0.01" damping="2" limited="true"/>
-    <geom contype="0" conaffinity="0" group="1" type="mesh" rgba="0.8 0.8 0.8 1"/>
-    <position ctrllimited="true" ctrlrange="-100 100"/>
+    <joint armature="0.01" damping="1" limited="true"/>
+    <geom contype="0" conaffinity="0" group="1" type="mesh" rgba="0.78 0.78 0.78 1"/>
+    <position ctrllimited="true"/>
   </default>
 
   <asset>
-    <texture name="grid" type="2d" builtin="checker" rgb1="0.2 0.2 0.2" rgb2="0.3 0.3 0.3" width="512" height="512"/>
-    <material name="grid" texture="grid" texrepeat="8 8" reflectance="0.1"/>
-    <material name="joint" rgba="0.2 0.6 0.8 1"/>
-    <material name="link" rgba="0.7 0.7 0.7 1"/>
-    <material name="base" rgba="0.3 0.3 0.3 1"/>
-    
-    <!-- 网格文件 -->
-    <mesh name="base_mesh" file="base.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="joint1_mesh" file="joint1.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="joint23_mesh" file="joint23.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="joint4_mesh" file="joint4.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="joint5_mesh" file="joint5.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="joint6_mesh" file="joint6.stl" scale="0.001 0.001 0.001"/>
+    <texture name="grid" type="2d" builtin="checker"
+             rgb1="0.2 0.2 0.2" rgb2="0.3 0.3 0.3" width="512" height="512"/>
+    <material name="grid"  texture="grid" texrepeat="8 8" reflectance="0.1"/>
+    <material name="robot" rgba="0.78 0.78 0.78 1"/>
+    <material name="acct"  rgba="0.3 0.6 0.9 1"/>
+
+    <!-- 单位 mm → 乘 0.001 转米 -->
+    <mesh name="base_mesh"   file="base_link.stl"  scale="0.001 0.001 0.001"/>
+    <mesh name="link1_mesh"  file="link1_1.stl"    scale="0.001 0.001 0.001"/>
+    <mesh name="link2_mesh"  file="link2_1.stl"    scale="0.001 0.001 0.001"/>
+    <mesh name="link3_mesh"  file="link3_1.stl"    scale="0.001 0.001 0.001"/>
+    <mesh name="link4_mesh"  file="link4_1.stl"    scale="0.001 0.001 0.001"/>
+    <mesh name="link5_mesh"  file="link5_1.stl"    scale="0.001 0.001 0.001"/>
+    <mesh name="link6_mesh"  file="link6_1.stl"    scale="0.001 0.001 0.001"/>
+    <mesh name="figer1_mesh" file="figer1_1.stl"   scale="0.001 0.001 0.001"/>
+    <mesh name="figer2_mesh" file="figer2_1.stl"   scale="0.001 0.001 0.001"/>
+    <mesh name="camera_mesh" file="camera_1.stl"   scale="0.001 0.001 0.001"/>
   </asset>
 
   <worldbody>
-    <!-- 地面 -->
     <geom name="floor" size="0 0 0.05" type="plane" material="grid"/>
-    <light name="spotlight" mode="targetbodycom" target="base" pos="0 -1 2"/>
-    
-    <!-- 机械臂基座 -->
+    <light name="light0" pos="0  0  3" dir="0 0 -1" diffuse="0.7 0.7 0.7" specular="0.2 0.2 0.2"/>
+    <light name="light1" pos="1 -1  2" dir="-1 1 -1" diffuse="0.4 0.4 0.4"/>
+
+    <!-- ── 基座 (固定) ── -->
     <body name="base" pos="0 0 0">
-      <geom name="base_geom" mesh="base_mesh" material="base"/>
-      
-      <!-- Joint 1: 底座旋转 -->
-      <body name="link1" pos="0 0 0.109">
-        <joint name="joint1" type="hinge" axis="0 0 1" range="-170 170" damping="1"/>
-        <geom name="joint1_geom" mesh="joint1_mesh" material="joint"/>
-        
-        <!-- Joint 2: 肩部 -->
-        <body name="link2" pos="0 0 0.035">
-          <joint name="joint2" type="hinge" axis="0 1 0" range="-75 0" damping="1"/>
-          <geom name="joint2_geom" mesh="joint23_mesh" material="link"/>
-          
-          <!-- Joint 3: 肘部 -->
-          <body name="link3" pos="0 0 0.146">
-            <joint name="joint3" type="hinge" axis="0 1 0" range="35 180" damping="1"/>
-            <geom name="joint3_geom" mesh="joint23_mesh" material="link"/>
-            
-            <!-- Joint 4: 小臂旋转 -->
-            <body name="link4" pos="0 0 0.115">
-              <joint name="joint4" type="hinge" axis="0 0 1" range="-170 170" damping="0.5"/>
-              <geom name="joint4_geom" mesh="joint4_mesh" material="joint"/>
-              
-              <!-- Joint 5: 腕部 -->
-              <body name="link5" pos="0 0 0.052">
-                <joint name="joint5" type="hinge" axis="0 1 0" range="-120 120" damping="0.5"/>
-                <geom name="joint5_geom" mesh="joint5_mesh" material="link"/>
-                
-                <!-- Joint 6: 末端旋转 -->
-                <body name="link6" pos="0 0 0.072">
-                  <joint name="joint6" type="hinge" axis="0 0 1" range="-720 720" damping="0.5"/>
-                  <geom name="joint6_geom" mesh="joint6_mesh" material="joint"/>
-                  
-                  <!-- 末端执行器标记 -->
-                  <site name="end_effector" pos="0 0 0.02" size="0.01" rgba="1 0 0 1"/>
+      <geom name="base_geom" mesh="base_mesh" pos="0 0 0" material="robot"/>
+
+      <!-- Joint 1: 底座旋转  axis=-Z  range≈±172° -->
+      <body name="link1" pos="0 0 0.096">
+        <joint name="joint1" type="hinge" axis="0 0 -1"
+               range="-3.001966 3.001966" damping="2"/>
+        <geom name="link1_geom" mesh="link1_mesh" pos="0 0 -0.096" material="robot"/>
+
+        <!-- Joint 2: 肩部  axis=+X  range=[-90°,75°] -->
+        <body name="link2" pos="-0.011639 0.034477 0.0285">
+          <joint name="joint2" type="hinge" axis="1 0 0"
+                 range="-1.570796 1.308997" damping="2"/>
+          <geom name="link2_geom" mesh="link2_mesh"
+                pos="0.011639 -0.034477 -0.1245" material="robot"/>
+
+          <!-- Joint 3: 肘部  axis=-X  range≈[-86°,90°] -->
+          <body name="link3" pos="0.03615 0 0.168">
+            <joint name="joint3" type="hinge" axis="-1 0 0"
+                   range="-1.500983 1.570796" damping="2"/>
+            <geom name="link3_geom" mesh="link3_mesh"
+                  pos="-0.024511 -0.034477 -0.2925" material="robot"/>
+
+            <!-- Joint 4: 小臂旋转  axis=-Y  range=±180° -->
+            <body name="link4" pos="-0.013162 0.0041 0.062467">
+              <joint name="joint4" type="hinge" axis="0 -1 0"
+                     range="-3.141593 3.141593" damping="1"/>
+              <geom name="link4_geom" mesh="link4_mesh"
+                    pos="-0.011349 -0.038577 -0.354967" material="robot"/>
+
+              <!-- Joint 5: 腕部  axis=-X  range≈[-110°,120°] -->
+              <body name="link5" pos="0.0213 0.11 0">
+                <joint name="joint5" type="hinge" axis="-1 0 0"
+                       range="-1.919862 2.094395" damping="1"/>
+                <geom name="link5_geom" mesh="link5_mesh"
+                      pos="-0.032649 -0.148577 -0.354967" material="robot"/>
+
+                <!-- 相机 (固定在 link5) -->
+                <body name="camera" pos="-0.021688 0.0929 0.023662">
+                  <geom name="camera_geom" mesh="camera_mesh"
+                        pos="-0.010961 -0.241477 -0.378629" material="acct"/>
+                </body>
+
+                <!-- Joint 6: 末端旋转  axis=-Y  range=±180° -->
+                <body name="link6" pos="-0.019822 0.1195 -0.001226">
+                  <joint name="joint6" type="hinge" axis="0 -1 0"
+                         range="-3.141593 3.141593" damping="1"/>
+                  <geom name="link6_geom" mesh="link6_mesh"
+                        pos="-0.012827 -0.268077 -0.353741" material="robot"/>
+
+                  <!-- 夹爪手指 1 (prismatic, 向 +X 张开) -->
+                  <body name="figer1" pos="0.012824 0.074462 -0.0001">
+                    <joint name="figer1" type="slide" axis="1 0 0"
+                           range="0 0.028" damping="0.5"/>
+                    <geom name="figer1_geom" mesh="figer1_mesh"
+                          pos="-0.025651 -0.342539 -0.353641" material="robot"/>
+                  </body>
+
+                  <!-- 夹爪手指 2 (prismatic, 向 -X 张开) -->
+                  <body name="figer2" pos="-0.012176 0.074462 0">
+                    <joint name="figer2" type="slide" axis="1 0 0"
+                           range="-0.028 0" damping="0.5"/>
+                    <geom name="figer2_geom" mesh="figer2_mesh"
+                          pos="-0.000651 -0.342539 -0.353741" material="robot"/>
+                  </body>
+
+                  <!-- 末端执行器标记 (夹爪中心前端) -->
+                  <site name="end_effector" pos="0 0.075 0"
+                        size="0.008" rgba="1 0 0 0.8"/>
                 </body>
               </body>
             </body>
@@ -81,25 +123,34 @@
   </worldbody>
 
   <actuator>
-    <position name="joint1_ctrl" joint="joint1" kp="1000" kv="100" ctrlrange="-170 170"/>
-    <position name="joint2_ctrl" joint="joint2" kp="1000" kv="100" ctrlrange="-75 0"/>
-    <position name="joint3_ctrl" joint="joint3" kp="1000" kv="100" ctrlrange="35 180"/>
-    <position name="joint4_ctrl" joint="joint4" kp="800" kv="80" ctrlrange="-170 170"/>
-    <position name="joint5_ctrl" joint="joint5" kp="800" kv="80" ctrlrange="-120 120"/>
-    <position name="joint6_ctrl" joint="joint6" kp="500" kv="50" ctrlrange="-720 720"/>
+    <!-- 6 个旋转关节 -->
+    <position name="joint1_ctrl" joint="joint1" kp="500" kv="50"
+              ctrlrange="-3.001966 3.001966"/>
+    <position name="joint2_ctrl" joint="joint2" kp="500" kv="50"
+              ctrlrange="-1.570796 1.308997"/>
+    <position name="joint3_ctrl" joint="joint3" kp="500" kv="50"
+              ctrlrange="-1.500983 1.570796"/>
+    <position name="joint4_ctrl" joint="joint4" kp="300" kv="30"
+              ctrlrange="-3.141593 3.141593"/>
+    <position name="joint5_ctrl" joint="joint5" kp="300" kv="30"
+              ctrlrange="-1.919862 2.094395"/>
+    <position name="joint6_ctrl" joint="joint6" kp="200" kv="20"
+              ctrlrange="-3.141593 3.141593"/>
+    <!-- 夹爪 -->
+    <position name="figer1_ctrl" joint="figer1" kp="100" kv="10"
+              ctrlrange="0 0.028"/>
+    <position name="figer2_ctrl" joint="figer2" kp="100" kv="10"
+              ctrlrange="-0.028 0"/>
   </actuator>
 
   <sensor>
-    <!-- 关节位置传感器 -->
     <jointpos name="joint1_pos" joint="joint1"/>
     <jointpos name="joint2_pos" joint="joint2"/>
     <jointpos name="joint3_pos" joint="joint3"/>
     <jointpos name="joint4_pos" joint="joint4"/>
     <jointpos name="joint5_pos" joint="joint5"/>
     <jointpos name="joint6_pos" joint="joint6"/>
-    
-    <!-- 末端位置传感器 -->
-    <framepos name="end_effector_pos" objtype="site" objname="end_effector"/>
+    <framepos  name="end_effector_pos"  objtype="site" objname="end_effector"/>
     <framequat name="end_effector_quat" objtype="site" objname="end_effector"/>
   </sensor>
 

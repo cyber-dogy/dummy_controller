@@ -32,29 +32,18 @@ class TrajectoryPoint:
 
 
 class TeachMode:
-    """示教模式控制器 - 包含CAN总线通信保护"""
-    
-    # CAN总线通信参数
-    MIN_SAMPLE_INTERVAL = 0.05      # 最小采样间隔 50ms (20Hz)
-    MAX_SAMPLE_INTERVAL = 0.5       # 最大采样间隔 500ms (2Hz)
-    CAN_TX_TIMEOUT = 0.1            # CAN发送超时 100ms
-    MAX_TRAJECTORY_POINTS = 10000   # 最大轨迹点数（防止内存溢出）
-    
+    """示教模式控制器"""
+
+    DEFAULT_SAMPLE_INTERVAL = 0.1   # 默认采样间隔 100ms（10Hz），与串口延迟匹配
+    MAX_TRAJECTORY_POINTS = 5000
+
     def __init__(self, robot):
         self.robot = robot
         self.recording = False
         self.trajectory: List[TrajectoryPoint] = []
         self.record_thread = None
-        self.sample_interval = self.MIN_SAMPLE_INTERVAL  # 默认50ms
+        self.sample_interval = self.DEFAULT_SAMPLE_INTERVAL
         self.on_record_callback: Optional[Callable] = None
-        
-        # CAN总线保护统计
-        self.stats = {
-            'dropped_points': 0,        # 因缓冲区满丢弃的点
-            'tx_timeouts': 0,           # 发送超时次数
-            'can_errors': 0,            # CAN错误次数
-            'throttled_points': 0,      # 因限流跳过的点
-        }
         
     def enter_teach_mode(self, current_limit: float = 0.5) -> bool:
         """
@@ -91,108 +80,126 @@ class TeachMode:
         return self.trajectory.copy()
     
     def _record_loop(self):
-        """记录循环（后台线程）- 带CAN总线保护"""
-        from utils.config import JointLimitChecker
-        
+        """记录循环（后台线程）"""
         start_time = time.time()
-        last_log_time = 0
-        violation_count = 0
-        last_sample_time = 0
         consecutive_errors = 0
-        
+
         while self.recording:
+            t0 = time.time()
             try:
-                loop_start = time.time()
-                
-                # 采样率保护：确保最小间隔
-                elapsed = loop_start - last_sample_time
-                if elapsed < self.MIN_SAMPLE_INTERVAL:
-                    time.sleep(self.MIN_SAMPLE_INTERVAL - elapsed)
-                
-                last_sample_time = time.time()
-                
-                # 检查轨迹点数上限（内存保护）
-                if len(self.trajectory) >= self.MAX_TRAJECTORY_POINTS:
-                    self.stats['dropped_points'] += 1
-                    if len(self.trajectory) == self.MAX_TRAJECTORY_POINTS:
-                        print(f"[警告] 轨迹点数达到上限 {self.MAX_TRAJECTORY_POINTS}，将停止记录")
-                    continue
-                
-                # 读取当前位置（带超时保护）
-                angles = self._safe_get_position()
-                
+                angles = self.robot.get_position()
+
                 if angles:
-                    # 重置错误计数
                     consecutive_errors = 0
-                    
-                    # 自动限制到合法范围
-                    clamped_angles = JointLimitChecker.clamp_angles(angles)
-                    
-                    # 检查是否有超限（仅在示教时可能发生）
-                    if not JointLimitChecker.is_valid(angles):
-                        violation_count += 1
-                        current_time = time.time() - start_time
-                        # 每5秒报告一次
-                        if current_time - last_log_time > 5:
-                            print(f"[警告] 检测到 {violation_count} 次关节角度超限，已自动限制")
-                            last_log_time = current_time
-                    
                     point = TrajectoryPoint(
-                        timestamp=time.time() - start_time,
-                        angles=clamped_angles
+                        timestamp=t0 - start_time,
+                        angles=angles
                     )
                     self.trajectory.append(point)
-                    
-                    # 回调更新GUI
+
                     if self.on_record_callback:
                         self.on_record_callback(point)
+
+                    if len(self.trajectory) >= self.MAX_TRAJECTORY_POINTS:
+                        print(f"[示教] 达到最大轨迹点数 {self.MAX_TRAJECTORY_POINTS}，停止记录")
+                        self.recording = False
+                        break
                 else:
-                    # 读取失败
                     consecutive_errors += 1
                     if consecutive_errors > 5:
-                        print(f"[错误] 连续 {consecutive_errors} 次读取位置失败，停止记录")
+                        print("[示教] 连续5次读取位置失败，停止记录")
+                        self.recording = False
                         break
-                    time.sleep(0.1)  # 错误后等待更长时间
-                    
+
             except Exception as e:
-                print(f"记录出错: {e}")
+                print(f"[示教] 记录出错: {e}")
                 consecutive_errors += 1
                 if consecutive_errors > 5:
+                    self.recording = False
                     break
-                time.sleep(0.1)
+
+            # 控制采样率（扣除本次读取耗时）
+            elapsed = time.time() - t0
+            sleep_time = self.sample_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
     
-    def _safe_get_position(self, timeout: float = 0.5) -> Optional[List[float]]:
+    def smooth_trajectory_adaptive(self, trajectory: List[TrajectoryPoint],
+                                   strength: int = 5) -> List[TrajectoryPoint]:
         """
-        安全地获取位置（带超时保护）
-        
+        自适应平滑：专门针对拖动示教卡顿轨迹。
+        步骤：
+          1. 去除停滞段（连续相同位置，用户没有移动时产生的冗余采样）
+          2. Gaussian 加权移动平均（比均匀平均更平滑且边缘不失真）
+          3. 三次样条重采样到均匀时间步长
+
         Args:
-            timeout: 超时时间（秒）
-        
-        Returns:
-            角度列表或None
+            trajectory: 原始轨迹
+            strength: 平滑强度 1-10（1=轻微，10=极度平滑）
         """
-        import threading
-        result = [None]
-        
-        def get_pos():
-            try:
-                result[0] = self.robot.get_position()
-            except Exception as e:
-                result[0] = None
-        
-        thread = threading.Thread(target=get_pos)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout)
-        
-        if thread.is_alive():
-            self.stats['tx_timeouts'] += 1
-            print(f"[警告] 读取位置超时（>{timeout}s）")
-            return None
-        
-        return result[0]
-    
-    def smooth_trajectory(self, trajectory: List[TrajectoryPoint], 
+        if len(trajectory) < 4:
+            return trajectory
+
+        # --- 步骤 1：去停滞段 ---
+        # 相邻点最大角度变化 < 0.3° 认为是停滞，合并为一个点
+        STALL_THRESH = 0.3
+        deduped = [trajectory[0]]
+        for pt in trajectory[1:]:
+            prev = deduped[-1]
+            max_delta = max(abs(a - b) for a, b in zip(pt.angles, prev.angles))
+            if max_delta >= STALL_THRESH:
+                deduped.append(pt)
+        # 始终保留最后一个点
+        if deduped[-1] is not trajectory[-1]:
+            deduped.append(trajectory[-1])
+
+        if len(deduped) < 4:
+            return deduped
+
+        # --- 步骤 2：Gaussian 加权平均 ---
+        # 窗口大小由 strength 决定：strength=1 → window=3，strength=10 → window=21
+        window = max(3, strength * 2 + 1)
+        # 构建 Gaussian 核
+        sigma = window / 6.0
+        half = window // 2
+        kernel = np.array([
+            np.exp(-0.5 * ((i - half) / sigma) ** 2)
+            for i in range(window)
+        ])
+        kernel /= kernel.sum()
+
+        angles_arr = np.array([p.angles for p in deduped])  # (N, 6)
+        smoothed_angles = np.zeros_like(angles_arr)
+        N = len(deduped)
+
+        for j in range(6):
+            col = angles_arr[:, j]
+            # 用边缘反射填充，避免边缘失真
+            padded = np.pad(col, half, mode='reflect')
+            smoothed_angles[:, j] = np.convolve(padded, kernel, mode='valid')[:N]
+
+        # --- 步骤 3：均匀时间重采样（100ms 间隔） ---
+        times = np.array([p.timestamp for p in deduped])
+        new_times = np.arange(0, times[-1], self.sample_interval)
+
+        result = []
+        for t in new_times:
+            interp_angles = [
+                float(np.interp(t, times, smoothed_angles[:, j]))
+                for j in range(6)
+            ]
+            result.append(TrajectoryPoint(timestamp=float(t), angles=interp_angles))
+
+        # 补上最后一个点（避免截断）
+        if result[-1].timestamp < times[-1] - 0.01:
+            result.append(TrajectoryPoint(
+                timestamp=float(times[-1]),
+                angles=smoothed_angles[-1].tolist()
+            ))
+
+        return result
+
+    def smooth_trajectory(self, trajectory: List[TrajectoryPoint],
                           window_size: int = 5) -> List[TrajectoryPoint]:
         """
         轨迹平滑处理（移动平均滤波），并确保在限位内

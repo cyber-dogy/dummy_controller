@@ -1,757 +1,533 @@
 #!/usr/bin/env python3
 """
-示教功能对话框
-集成电流环示教、轨迹记录、平滑、保存
+示教功能对话框 v3 - 重新设计
+流程: 连接 → 使能 → 进入示教(降低增益) → 拖动+记录 → 退出示教(恢复增益) → 回放
 """
 
-import json
 import os
 from datetime import datetime
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGroupBox, QProgressBar, QTextEdit, QFileDialog, QMessageBox,
-    QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QSlider
+    QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QSlider, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt6.QtGui import QFont
 import numpy as np
 
 
+# ── 回放线程 ────────────────────────────────────────────────────────────────
+
 class PlaybackThread(QThread):
-    """轨迹回放后台线程"""
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal()
     log_signal = pyqtSignal(str)
-    
+
     def __init__(self, robot, trajectory, speed_ratio):
         super().__init__()
         self.robot = robot
         self.trajectory = trajectory
         self.speed_ratio = speed_ratio
         self.stopped = False
-        self.violations_count = 0
-    
+
     def run(self):
         import time
-        from utils.config import JointLimitChecker
-        
-        # CAN总线保护参数
-        MIN_TX_INTERVAL = 0.03  # 最小发送间隔 30ms（约33Hz）
-        
-        # 先验证并限制所有轨迹点
-        valid_trajectory = []
-        for point in self.trajectory:
-            clamped = JointLimitChecker.clamp_angles(point.angles)
-            if not JointLimitChecker.is_valid(point.angles):
-                self.violations_count += 1
-            valid_trajectory.append(type(point)(timestamp=point.timestamp, angles=clamped))
-        
-        if self.violations_count > 0:
-            self.log_signal.emit(f"[警告] 轨迹中有 {self.violations_count} 个点超出限位，已自动限制")
-        
-        # 检查轨迹频率，如果过高则稀疏化
-        if len(valid_trajectory) > 2:
-            duration = valid_trajectory[-1].timestamp - valid_trajectory[0].timestamp
-            if duration > 0:
-                rate = len(valid_trajectory) / duration
-                if rate > 25:  # 如果频率超过25Hz，需要稀疏化
-                    self.log_signal.emit(f"[CAN保护] 轨迹频率 {rate:.1f}Hz 过高，进行稀疏化")
-                    step = max(1, int(rate / 20))  # 降到约20Hz
-                    valid_trajectory = valid_trajectory[::step]
-                    self.log_signal.emit(f"[CAN保护] 稀疏化后: {len(valid_trajectory)}点")
-        
-        # 获取当前位置，添加平滑过渡
-        current_pos = self.robot.get_position()
-        if current_pos:
-            current_pos = JointLimitChecker.clamp_angles(current_pos)
-            first_point = valid_trajectory[0]
-            max_diff = max(abs(a - b) for a, b in zip(first_point.angles, current_pos))
-            
-            if max_diff > 10:  # 如果差距大于10度，插入过渡点
-                self.log_signal.emit(f"[信息] 当前位置与轨迹起点差距 {max_diff:.1f}°，插入平滑过渡")
-                transition = JointLimitChecker.interpolate_to_limit(
-                    current_pos, first_point.angles, steps=5
-                )
-                for t_angles in transition[:-1]:
-                    if self.stopped:
-                        return
-                    self.robot.move_to(t_angles, check_limits=False)
-                    time.sleep(0.05)
-        
-        # 执行轨迹 - 带CAN总线保护
-        last_tx_time = 0
-        tx_count = 0
-        skip_count = 0
-        error_count = 0
-        
-        self.log_signal.emit(f"[CAN回放] 开始回放 {len(valid_trajectory)} 点")
-        
-        for idx, point in enumerate(valid_trajectory):
+        traj = self.trajectory
+        n = len(traj)
+        self.log_signal.emit(f"开始回放 {n} 个点，速度 {self.speed_ratio:.1f}x")
+
+        for idx, point in enumerate(traj):
             if self.stopped:
                 break
-            
-            current_time = time.time()
-            
-            # CAN总线限流保护
-            if current_time - last_tx_time < MIN_TX_INTERVAL:
-                skip_count += 1
-                continue
-            
-            # 发送运动指令
-            success, msg = self.robot.move_to(point.angles, check_limits=False)
-            
-            if success:
-                tx_count += 1
-                last_tx_time = current_time
-            else:
-                error_count += 1
-                if error_count <= 3:  # 只显示前3个错误
-                    self.log_signal.emit(f"[警告] 第 {idx} 点发送失败: {msg}")
-            
-            # 计算等待时间
-            if idx < len(valid_trajectory) - 1:
-                next_time = valid_trajectory[idx + 1].timestamp
-                point_time = point.timestamp
-                wait_time = (next_time - point_time) / self.speed_ratio
-                # 确保最小等待时间
-                time.sleep(max(MIN_TX_INTERVAL, wait_time))
-            
-            progress = int((idx + 1) / len(valid_trajectory) * 100)
-            self.progress_signal.emit(progress)
-        
-        # 回放统计
-        if skip_count > 0:
-            self.log_signal.emit(f"[CAN回放] 完成: 发送 {tx_count} 点, 限流跳过 {skip_count} 点")
-        else:
-            self.log_signal.emit(f"[CAN回放] 完成: 发送 {tx_count} 点")
-        
-        if error_count > 0:
-            self.log_signal.emit(f"[CAN回放] 警告: {error_count} 次发送失败")
-        
+            ok, msg = self.robot.move_to(point.angles, check_limits=False)
+            if not ok:
+                self.log_signal.emit(f"第 {idx} 点发送失败: {msg}")
+
+            if idx < n - 1:
+                dt = (traj[idx + 1].timestamp - point.timestamp) / self.speed_ratio
+                time.sleep(max(0.02, dt))
+
+            self.progress_signal.emit(int((idx + 1) / n * 100))
+
         self.finished_signal.emit()
-    
+
     def stop(self):
         self.stopped = True
 
 
+# ── 主对话框 ─────────────────────────────────────────────────────────────────
+
 class TeachDialog(QDialog):
-    """示教功能对话框"""
-    
+
+    # 后台线程 → 主线程更新点数（线程安全）
+    record_count_signal = pyqtSignal(int)
+
     def __init__(self, robot, parent=None):
         super().__init__(parent)
         self.robot = robot
         self.teach_mode = None
         self.recording = False
+        self.in_teach_mode = False
         self.current_trajectory = []
         self.playback_thread = None
-        
-        self.setWindowTitle("🎓 示教功能 - 拖动示教 & 轨迹记录")
-        self.setMinimumSize(700, 600)
-        self.setup_ui()
-        
-        # 更新定时器
-        self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(self.update_live_data)
-        
-        # 初始化示教模块
+
+        self.setWindowTitle("示教功能")
+        self.setMinimumSize(620, 680)
+        self._build_ui()
+
+        # 定时刷新状态栏（500ms，主线程安全）
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self._refresh_status)
+        self.status_timer.start(500)
+
+        # signal → label（线程安全更新点数）
+        self.record_count_signal.connect(
+            lambda n: self.lbl_record_status.setText(f"记录中…  {n} 点")
+        )
+
         try:
             from core.teach_mode import TeachMode
             self.teach_mode = TeachMode(robot)
-            self.teach_mode.on_record_callback = self.on_record_point
+            self.teach_mode.on_record_callback = self._on_record_point
         except Exception as e:
-            self.log(f"⚠️ 示教模块初始化失败: {e}")
-    
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        
-        # ========== 示教控制区 ==========
-        teach_group = QGroupBox("🎮 示教控制")
-        teach_layout = QVBoxLayout(teach_group)
-        
-        # 电流限制设置（电流环模式）
-        current_group = QGroupBox("⚡ 电流环设置")
-        current_group_layout = QVBoxLayout(current_group)
-        
-        # 说明文字
-        current_info = QLabel(
-            "电流环模式：电机输出恒定电流，产生可预测的阻力\n"
-            "• 小电流(0.5-1.0A)：轻松拖动，适合快速示教\n"
-            "• 中电流(1.0-1.8A)：适度阻力，适合精确示教（推荐 1.5A）\n"
-            "• 大电流(2.0A+)：较重阻力，接近正常工作状态"
+            self._log(f"示教模块初始化失败: {e}")
+
+    # ── UI 构建 ──────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        # ── 1. 状态栏 ────────────────────────────────────────────────────────
+        status_frame = QFrame()
+        status_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        status_frame.setStyleSheet("background:#f0f4f8; border-radius:4px;")
+        sl = QHBoxLayout(status_frame)
+        sl.setContentsMargins(10, 6, 10, 6)
+
+        self.lbl_conn = QLabel("● 未连接")
+        self.lbl_conn.setStyleSheet("color:red; font-weight:bold;")
+        self.lbl_enable = QLabel("○ 未使能")
+        self.lbl_enable.setStyleSheet("color:gray; font-weight:bold;")
+
+        self.btn_enable = QPushButton("使能电机")
+        self.btn_enable.setFixedWidth(80)
+        self.btn_enable.clicked.connect(self._toggle_enable)
+
+        btn_estop = QPushButton("急停")
+        btn_estop.setFixedWidth(60)
+        btn_estop.setStyleSheet("background:#f44336; color:white; font-weight:bold;")
+        btn_estop.clicked.connect(self._emergency_stop)
+
+        sl.addWidget(self.lbl_conn)
+        sl.addSpacing(16)
+        sl.addWidget(self.lbl_enable)
+        sl.addStretch()
+        sl.addWidget(self.btn_enable)
+        sl.addWidget(btn_estop)
+        root.addWidget(status_frame)
+
+        # ── 2. 示教模式 ───────────────────────────────────────────────────────
+        teach_group = QGroupBox("示教模式")
+        tl = QVBoxLayout(teach_group)
+
+        info = QLabel(
+            "进入示教模式后发送 !DISABLE，电机停止位置控制，手感与断电相同（只剩减速器机械摩擦）。\n"
+            "退出时先读当前位置，再上电并立即发送保持指令，不会突然跳位。\n"
+            "注意：减速比较大（50-100:1），拖动需要一定力度，臂会因重力略有下沉。"
         )
-        current_info.setStyleSheet("color: #666; font-size: 10px;")
-        current_group_layout.addWidget(current_info)
-        
-        # 电流值设置
-        current_layout = QHBoxLayout()
-        current_layout.addWidget(QLabel("电流值:"))
-        
-        self.current_slider = QSlider(Qt.Orientation.Horizontal)
-        self.current_slider.setRange(1, 30)  # 0.1A ~ 3.0A
-        self.current_slider.setValue(15)  # 默认 1.5A
-        self.current_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        current_layout.addWidget(self.current_slider)
-        
-        self.current_spin = QDoubleSpinBox()
-        self.current_spin.setRange(0.1, 3.0)
-        self.current_spin.setValue(1.5)
-        self.current_spin.setSingleStep(0.1)
-        self.current_spin.setSuffix(" A")
-        current_layout.addWidget(self.current_spin)
-        
-        # 联动滑动条和数字框
-        self.current_slider.valueChanged.connect(
-            lambda v: self.current_spin.setValue(v / 10.0)
-        )
-        self.current_spin.valueChanged.connect(
-            lambda v: self.current_slider.setValue(int(v * 10))
-        )
-        
-        current_group_layout.addLayout(current_layout)
-        teach_layout.addWidget(current_group)
-        
-        # 示教按钮
-        btn_layout = QHBoxLayout()
-        self.btn_enter_teach = QPushButton("🔓 进入示教模式")
-        self.btn_enter_teach.setStyleSheet("background: #2196F3; color: white; padding: 10px;")
-        self.btn_enter_teach.clicked.connect(self.enter_teach_mode)
-        
-        self.btn_exit_teach = QPushButton("🔒 退出示教模式")
-        self.btn_exit_teach.setStyleSheet("background: #FF9800; color: white; padding: 10px;")
-        self.btn_exit_teach.clicked.connect(self.exit_teach_mode)
+        info.setStyleSheet("color:#555; font-size:10px;")
+        info.setWordWrap(True)
+        tl.addWidget(info)
+
+        teach_btn_row = QHBoxLayout()
+        self.btn_enter_teach = QPushButton("进入示教模式")
+        self.btn_enter_teach.setStyleSheet(
+            "background:#2196F3; color:white; padding:8px; font-size:13px;")
+        self.btn_enter_teach.clicked.connect(self._enter_teach)
+
+        self.btn_exit_teach = QPushButton("退出示教模式")
+        self.btn_exit_teach.setStyleSheet(
+            "background:#FF9800; color:white; padding:8px; font-size:13px;")
+        self.btn_exit_teach.clicked.connect(self._exit_teach)
         self.btn_exit_teach.setEnabled(False)
-        
-        btn_layout.addWidget(self.btn_enter_teach)
-        btn_layout.addWidget(self.btn_exit_teach)
-        teach_layout.addLayout(btn_layout)
-        
-        # 关节限位信息
-        limits_group = QGroupBox("⚠️ 关节限位信息")
-        limits_layout = QVBoxLayout(limits_group)
-        
-        from utils.config import JOINT_NAMES, JOINT_LIMITS
-        limits_text = ""
-        for i, (name, (min_val, max_val)) in enumerate(zip(JOINT_NAMES, JOINT_LIMITS)):
-            limits_text += f"{name}: [{min_val}°, {max_val}°]"
-            if i < 5:
-                limits_text += " | "
-            if i == 2:  # 每3个换行
-                limits_text += "\n"
-        
-        limits_label = QLabel(limits_text)
-        limits_label.setStyleSheet("color: #666; font-size: 9px; font-family: monospace;")
-        limits_layout.addWidget(limits_label)
-        
-        # 特别警告J3的限制
-        j3_warning = QLabel("⚠️ 特别注意: J3 肘部最小 35° (固件硬编码限制)")
-        j3_warning.setStyleSheet("color: #FF5722; font-size: 10px; font-weight: bold;")
-        limits_layout.addWidget(j3_warning)
-        
-        teach_layout.addWidget(limits_group)
-        
-        layout.addWidget(teach_group)
-        
-        # ========== 轨迹记录区 ==========
-        record_group = QGroupBox("📝 轨迹记录")
-        record_layout = QVBoxLayout(record_group)
-        
-        # 采样间隔
-        sample_layout = QHBoxLayout()
-        sample_layout.addWidget(QLabel("采样间隔:"))
-        self.sample_spin = QDoubleSpinBox()
-        self.sample_spin.setRange(0.02, 0.5)
-        self.sample_spin.setValue(0.05)
-        self.sample_spin.setSingleStep(0.01)
-        self.sample_spin.setSuffix(" s")
-        sample_layout.addWidget(self.sample_spin)
-        
-        sample_layout.addWidget(QLabel("平滑窗口:"))
-        self.smooth_spin = QSpinBox()
-        self.smooth_spin.setRange(3, 21)
-        self.smooth_spin.setValue(5)
-        self.smooth_spin.setSingleStep(2)
-        sample_layout.addWidget(self.smooth_spin)
-        
-        self.chk_auto_smooth = QCheckBox("自动平滑")
-        self.chk_auto_smooth.setChecked(True)
-        sample_layout.addWidget(self.chk_auto_smooth)
-        
-        sample_layout.addStretch()
-        record_layout.addLayout(sample_layout)
-        
-        # 记录按钮
-        record_btn_layout = QHBoxLayout()
-        self.btn_start_record = QPushButton("⏺️ 开始记录")
-        self.btn_start_record.setStyleSheet("background: #4CAF50; color: white; padding: 10px;")
-        self.btn_start_record.clicked.connect(self.start_recording)
-        
-        self.btn_stop_record = QPushButton("⏹️ 停止记录")
-        self.btn_stop_record.setStyleSheet("background: #f44336; color: white; padding: 10px;")
-        self.btn_stop_record.clicked.connect(self.stop_recording)
-        self.btn_stop_record.setEnabled(False)
-        
-        record_btn_layout.addWidget(self.btn_start_record)
-        record_btn_layout.addWidget(self.btn_stop_record)
-        record_layout.addLayout(record_btn_layout)
-        
-        # 记录状态
-        self.lbl_record_status = QLabel("状态: 未记录 | 点数: 0")
-        record_layout.addWidget(self.lbl_record_status)
-        
-        layout.addWidget(record_group)
-        
-        # ========== 回放控制区 ==========
-        playback_group = QGroupBox("▶️ 轨迹回放")
-        playback_layout = QVBoxLayout(playback_group)
-        
-        # 速度控制
-        speed_layout = QHBoxLayout()
-        speed_layout.addWidget(QLabel("回放速度:"))
-        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(25, 400)
-        self.speed_slider.setValue(100)
-        self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        speed_layout.addWidget(self.speed_slider)
+
+        teach_btn_row.addWidget(self.btn_enter_teach)
+        teach_btn_row.addWidget(self.btn_exit_teach)
+        tl.addLayout(teach_btn_row)
+        root.addWidget(teach_group)
+
+        # ── 3. 轨迹记录 ───────────────────────────────────────────────────────
+        rec_group = QGroupBox("轨迹记录")
+        rl = QVBoxLayout(rec_group)
+
+        # 参数行
+        param_row = QHBoxLayout()
+        param_row.addWidget(QLabel("采样间隔:"))
+        self.spin_interval = QDoubleSpinBox()
+        self.spin_interval.setRange(0.05, 0.5)
+        self.spin_interval.setValue(0.1)
+        self.spin_interval.setSingleStep(0.05)
+        self.spin_interval.setSuffix(" s")
+        self.spin_interval.setFixedWidth(80)
+        param_row.addWidget(self.spin_interval)
+
+        param_row.addSpacing(16)
+        self.chk_smooth = QCheckBox("自动平滑")
+        self.chk_smooth.setChecked(True)
+        param_row.addWidget(self.chk_smooth)
+
+        param_row.addWidget(QLabel("强度:"))
+        self.sld_smooth = QSlider(Qt.Orientation.Horizontal)
+        self.sld_smooth.setRange(1, 10)
+        self.sld_smooth.setValue(5)
+        self.sld_smooth.setFixedWidth(100)
+        self.lbl_smooth_val = QLabel("5")
+        self.sld_smooth.valueChanged.connect(
+            lambda v: self.lbl_smooth_val.setText(str(v))
+        )
+        param_row.addWidget(self.sld_smooth)
+        param_row.addWidget(self.lbl_smooth_val)
+        param_row.addStretch()
+        rl.addLayout(param_row)
+
+        # 按钮行
+        rec_btn_row = QHBoxLayout()
+        self.btn_start_rec = QPushButton("开始记录")
+        self.btn_start_rec.setStyleSheet(
+            "background:#4CAF50; color:white; padding:7px; font-size:12px;")
+        self.btn_start_rec.clicked.connect(self._start_recording)
+
+        self.btn_stop_rec = QPushButton("停止记录")
+        self.btn_stop_rec.setStyleSheet(
+            "background:#f44336; color:white; padding:7px; font-size:12px;")
+        self.btn_stop_rec.clicked.connect(self._stop_recording)
+        self.btn_stop_rec.setEnabled(False)
+
+        rec_btn_row.addWidget(self.btn_start_rec)
+        rec_btn_row.addWidget(self.btn_stop_rec)
+        rl.addLayout(rec_btn_row)
+
+        self.lbl_record_status = QLabel("就绪")
+        self.lbl_record_status.setStyleSheet("color:#666;")
+        rl.addWidget(self.lbl_record_status)
+
+        root.addWidget(rec_group)
+
+        # ── 4. 回放 & 保存 ────────────────────────────────────────────────────
+        pb_group = QGroupBox("轨迹回放 & 保存")
+        pl = QVBoxLayout(pb_group)
+
+        # 速度行
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("速度:"))
+        self.sld_speed = QSlider(Qt.Orientation.Horizontal)
+        self.sld_speed.setRange(25, 300)
+        self.sld_speed.setValue(100)
+        self.sld_speed.setFixedWidth(120)
         self.lbl_speed = QLabel("1.0x")
-        self.speed_slider.valueChanged.connect(lambda v: self.lbl_speed.setText(f"{v/100:.1f}x"))
-        speed_layout.addWidget(self.lbl_speed)
-        playback_layout.addLayout(speed_layout)
-        
-        # 回放进度
+        self.sld_speed.valueChanged.connect(
+            lambda v: self.lbl_speed.setText(f"{v/100:.1f}x")
+        )
+        speed_row.addWidget(self.sld_speed)
+        speed_row.addWidget(self.lbl_speed)
+        speed_row.addStretch()
+        pl.addLayout(speed_row)
+
+        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(True)
-        playback_layout.addWidget(self.progress_bar)
-        
-        # 回放按钮
-        playback_btn_layout = QHBoxLayout()
-        self.btn_playback = QPushButton("▶️ 回放轨迹")
-        self.btn_playback.setStyleSheet("background: #9C27B0; color: white; padding: 10px;")
-        self.btn_playback.clicked.connect(self.playback_trajectory)
-        
-        self.btn_stop_playback = QPushButton("⏹️ 停止回放")
-        self.btn_stop_playback.setStyleSheet("background: #f44336; color: white; padding: 10px;")
-        self.btn_stop_playback.clicked.connect(self.stop_playback)
-        self.btn_stop_playback.setEnabled(False)
-        
-        playback_btn_layout.addWidget(self.btn_playback)
-        playback_btn_layout.addWidget(self.btn_stop_playback)
-        playback_layout.addLayout(playback_btn_layout)
-        
-        layout.addWidget(playback_group)
-        
-        # ========== 保存与导出 ==========
-        save_group = QGroupBox("💾 保存与导出")
-        save_layout = QVBoxLayout(save_group)
-        
-        # 文件名设置
-        name_layout = QHBoxLayout()
-        name_layout.addWidget(QLabel("轨迹名称:"))
-        self.txt_traj_name = QTextEdit()
-        self.txt_traj_name.setMaximumHeight(30)
-        self.txt_traj_name.setPlaceholderText(f"轨迹_{datetime.now().strftime('%m%d_%H%M')}")
-        name_layout.addWidget(self.txt_traj_name)
-        save_layout.addLayout(name_layout)
-        
-        # 格式选择
-        format_layout = QHBoxLayout()
-        format_layout.addWidget(QLabel("保存格式:"))
-        self.cmb_format = QComboBox()
-        self.cmb_format.addItems(["JSON (完整数据)", "CSV (ML训练格式)"])
-        format_layout.addWidget(self.cmb_format)
-        format_layout.addStretch()
-        save_layout.addLayout(format_layout)
-        
-        # 保存按钮
-        save_btn_layout = QHBoxLayout()
-        self.btn_save = QPushButton("💾 保存轨迹")
-        self.btn_save.setStyleSheet("background: #009688; color: white; padding: 8px;")
-        self.btn_save.clicked.connect(self.save_trajectory)
-        
-        self.btn_load = QPushButton("📂 加载轨迹")
-        self.btn_load.setStyleSheet("background: #607D8B; color: white; padding: 8px;")
-        self.btn_load.clicked.connect(self.load_trajectory)
-        
-        save_btn_layout.addWidget(self.btn_save)
-        save_btn_layout.addWidget(self.btn_load)
-        save_layout.addLayout(save_btn_layout)
-        
-        layout.addWidget(save_group)
-        
-        # ========== 日志区 ==========
-        log_group = QGroupBox("📋 操作日志")
-        log_layout = QVBoxLayout(log_group)
-        
+        pl.addWidget(self.progress_bar)
+
+        # 按钮行 1：回放控制
+        pb_btn_row = QHBoxLayout()
+        self.btn_play = QPushButton("回放轨迹")
+        self.btn_play.setStyleSheet(
+            "background:#9C27B0; color:white; padding:7px; font-size:12px;")
+        self.btn_play.clicked.connect(self._playback)
+
+        self.btn_stop_play = QPushButton("停止回放")
+        self.btn_stop_play.setStyleSheet(
+            "background:#f44336; color:white; padding:7px; font-size:12px;")
+        self.btn_stop_play.clicked.connect(self._stop_playback)
+        self.btn_stop_play.setEnabled(False)
+
+        pb_btn_row.addWidget(self.btn_play)
+        pb_btn_row.addWidget(self.btn_stop_play)
+        pl.addLayout(pb_btn_row)
+
+        # 按钮行 2：保存/加载
+        save_row = QHBoxLayout()
+        btn_save_json = QPushButton("保存 JSON")
+        btn_save_json.clicked.connect(lambda: self._save('json'))
+        btn_save_csv = QPushButton("保存 CSV")
+        btn_save_csv.clicked.connect(lambda: self._save('csv'))
+        btn_load = QPushButton("加载轨迹")
+        btn_load.clicked.connect(self._load)
+
+        for b in (btn_save_json, btn_save_csv, btn_load):
+            b.setStyleSheet("padding:5px;")
+            save_row.addWidget(b)
+        save_row.addStretch()
+        pl.addLayout(save_row)
+
+        self.lbl_traj_info = QLabel("无轨迹")
+        self.lbl_traj_info.setStyleSheet("color:#666; font-size:10px;")
+        pl.addWidget(self.lbl_traj_info)
+
+        root.addWidget(pb_group)
+
+        # ── 5. 日志 ───────────────────────────────────────────────────────────
+        log_group = QGroupBox("日志")
+        ll = QVBoxLayout(log_group)
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setMaximumHeight(120)
-        log_layout.addWidget(self.txt_log)
-        
-        layout.addWidget(log_group)
-    
-    def enter_teach_mode(self):
-        """进入示教模式（电流环模式）"""
+        self.txt_log.setMaximumHeight(110)
+        ll.addWidget(self.txt_log)
+        root.addWidget(log_group)
+
+    # ── 状态刷新 ─────────────────────────────────────────────────────────────
+
+    def _refresh_status(self):
+        if self.robot.connected:
+            self.lbl_conn.setText("● 已连接")
+            self.lbl_conn.setStyleSheet("color:green; font-weight:bold;")
+        else:
+            self.lbl_conn.setText("● 未连接")
+            self.lbl_conn.setStyleSheet("color:red; font-weight:bold;")
+
+        if self.robot.enabled:
+            self.lbl_enable.setText("● 已使能")
+            self.lbl_enable.setStyleSheet("color:green; font-weight:bold;")
+            self.btn_enable.setText("禁用电机")
+        else:
+            self.lbl_enable.setText("○ 未使能")
+            self.lbl_enable.setStyleSheet("color:gray; font-weight:bold;")
+            self.btn_enable.setText("使能电机")
+
+    # ── 使能 / 急停 ──────────────────────────────────────────────────────────
+
+    def _toggle_enable(self):
         if not self.robot.connected:
             QMessageBox.warning(self, "警告", "请先连接机器人！")
             return
-        
-        # 未使能时自动使能
+        if self.robot.enabled:
+            self.robot.disable()
+            self._log("电机已禁用")
+        else:
+            if self.robot.enable():
+                self._log("电机已使能")
+            else:
+                self._log("使能失败")
+
+    def _emergency_stop(self):
+        self.robot.emergency_stop()
+        self._log("急停！")
+
+    # ── 示教模式 ─────────────────────────────────────────────────────────────
+
+    def _enter_teach(self):
+        if not self.robot.connected:
+            QMessageBox.warning(self, "警告", "请先连接机器人！")
+            return
         if not self.robot.enabled:
-            self.log("🔄 电机未使能，正在自动使能...")
+            self._log("电机未使能，正在自动使能…")
             if not self.robot.enable():
-                QMessageBox.critical(self, "错误", "自动使能失败，请检查电机状态！")
+                QMessageBox.critical(self, "错误", "使能失败，请检查连接！")
                 return
-            self.log("✅ 电机已自动使能")
-        
-        current = self.current_spin.value()
-        
-        self.log(f"🔄 正在进入示教模式（电流限制: {current}A）...")
-        
-        # 使用新的电流环示教模式
-        if self.robot.enter_teach_mode(current):
+
+        self._log("正在进入示教模式（降低 PID 增益）…")
+        if self.robot.enter_teach_mode():
+            self.in_teach_mode = True
             self.btn_enter_teach.setEnabled(False)
             self.btn_exit_teach.setEnabled(True)
-            
-            self.log(f"🔓 已进入示教模式（电流: {current}A）")
-            self.log("💡 现在你可以手动拖动机械臂了")
-            self.log("   提示：如果感觉太重，可以减小电流值；太轻可增大电流值")
-            
-            # 启动实时更新（500ms 避免阻塞主线程）
-            self.update_timer.start(500)
+            self._log("已进入示教模式 — 现在可以轻松拖动机械臂")
         else:
             QMessageBox.critical(self, "错误", "进入示教模式失败！")
-    
-    def exit_teach_mode(self):
-        """
-        退出示教模式，恢复位置控制
-        如果当前位置超出限位，会先平滑回到边界
-        """
+
+    def _exit_teach(self):
         if self.recording:
-            self.stop_recording()
-        
-        self.log("🔄 正在退出示教模式...")
-        
-        # 读取当前位置
-        current_pos = self.robot.get_position()
-        if not current_pos:
-            QMessageBox.warning(self, "警告", "无法读取当前位置，直接退出示教模式")
-            self._finish_exit_teach_mode()
-            return
-        
-        # 检查是否超出限位
-        from utils.config import JointLimitChecker, JOINT_NAMES
-        is_valid = JointLimitChecker.is_valid(current_pos)
-        
-        if not is_valid:
-            # 获取违规信息
-            violations = JointLimitChecker.get_violations(current_pos)
-            self.log("⚠️ 当前位置超出关节限位:")
-            for joint_idx, angle, min_val, max_val in violations:
-                self.log(f"   {JOINT_NAMES[joint_idx]}: {angle:.1f}° 超出 [{min_val}, {max_val}]")
-            
-            # 询问用户是否平滑回到合法位置
-            reply = QMessageBox.question(
-                self, "位置超限",
-                f"当前位置有 {len(violations)} 个关节超出限位。\n"
-                f"是否平滑移动回合法位置后再退出？\n\n"
-                f"选择'是'：平滑过渡回边界点（推荐）\n"
-                f"选择'否'：直接退出（可能有抖动）",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
-            )
-            
-            if reply == QMessageBox.StandardButton.Cancel:
-                self.log("❌ 取消退出示教模式")
-                return
-            
-            if reply == QMessageBox.StandardButton.Yes:
-                self.log("🔄 正在回到合法位置...")
-                
-                # 计算合法的目标位置（最近的边界点）
-                target_pos = JointLimitChecker.clamp_angles(current_pos)
-                
-                # 先使能电机，然后直接运动到边界点（避免在主线程 sleep 导致 GUI 卡住）
-                self.robot.enable()
-                self.robot.move_to(target_pos, speed=10)
-                self.log(f"✅ 已发送回边界指令: {target_pos}")
-        
-        # 完成退出
-        self._finish_exit_teach_mode()
-    
-    def _finish_exit_teach_mode(self):
-        """完成退出示教模式的后续操作"""
+            self._stop_recording()
+        self._log("正在退出示教模式（恢复增益并保位）…")
         if self.robot.exit_teach_mode():
+            self.in_teach_mode = False
             self.btn_enter_teach.setEnabled(True)
             self.btn_exit_teach.setEnabled(False)
-            self.update_timer.stop()
-            self.log("🔒 已退出示教模式，恢复位置控制")
+            self._log("已退出示教模式，恢复位置控制")
         else:
             QMessageBox.critical(self, "错误", "退出示教模式失败！")
-    
-    def start_recording(self):
-        """开始记录"""
-        if not self.btn_exit_teach.isEnabled():
+
+    # ── 记录 ─────────────────────────────────────────────────────────────────
+
+    def _start_recording(self):
+        if not self.in_teach_mode:
             QMessageBox.warning(self, "警告", "请先进入示教模式！")
             return
-        
-        self.current_trajectory = []
-        self.recording = True
-        
-        # 设置采样间隔
-        self.teach_mode.sample_interval = self.sample_spin.value()
+        if not self.teach_mode:
+            return
+
+        self.teach_mode.sample_interval = self.spin_interval.value()
         self.teach_mode.start_recording()
-        
-        self.btn_start_record.setEnabled(False)
-        self.btn_stop_record.setEnabled(True)
-        
-        self.log(f"⏺️ 开始记录轨迹（采样间隔: {self.sample_spin.value()}s）")
-    
-    def stop_recording(self):
-        """停止记录"""
+        self.recording = True
+
+        self.btn_start_rec.setEnabled(False)
+        self.btn_stop_rec.setEnabled(True)
+        self.lbl_record_status.setText("记录中…  0 点")
+        self._log(f"开始记录（采样间隔 {self.spin_interval.value():.2f}s）")
+
+    def _stop_recording(self):
+        if not self.teach_mode:
+            return
         self.recording = False
-        
-        raw_trajectory = self.teach_mode.stop_recording()
-        self.log(f"🛑 停止记录，原始点数: {len(raw_trajectory)}")
-        
-        # 自动平滑（包含边界限制）
-        if self.chk_auto_smooth.isChecked() and len(raw_trajectory) > 5:
-            window = self.smooth_spin.value()
-            self.current_trajectory = self.teach_mode.smooth_trajectory(raw_trajectory, window)
-            self.log(f"✅ 平滑处理完成（窗口: {window}）")
+        raw = self.teach_mode.stop_recording()
+        self._log(f"停止记录，原始点数: {len(raw)}")
+
+        if self.chk_smooth.isChecked() and len(raw) >= 4:
+            strength = self.sld_smooth.value()
+            self.current_trajectory = self.teach_mode.smooth_trajectory_adaptive(
+                raw, strength=strength
+            )
+            self._log(f"自适应平滑完成（强度 {strength}）: "
+                      f"{len(raw)} → {len(self.current_trajectory)} 点")
         else:
-            self.current_trajectory = raw_trajectory
-        
-        # 统一采样间隔（包含边界限制）
-        self.current_trajectory = self.teach_mode.interpolate_trajectory(
-            self.current_trajectory, 
-            self.sample_spin.value()
-        )
-        
-        # 最终边界验证
-        from utils.config import JointLimitChecker
-        violations = []
-        for idx, point in enumerate(self.current_trajectory):
-            if not JointLimitChecker.is_valid(point.angles):
-                violations.append(idx)
-        
-        if violations:
-            self.log(f"⚠️ 警告: 轨迹中有 {len(violations)} 个点超出限位")
-            self.log("   已自动限制到合法范围")
-        
-        self.log(f"📊 最终轨迹: {len(self.current_trajectory)} 点")
-        self.log(f"   J1范围: {min(p.angles[0] for p in self.current_trajectory):.1f}° ~ {max(p.angles[0] for p in self.current_trajectory):.1f}°")
-        self.log(f"   J2范围: {min(p.angles[1] for p in self.current_trajectory):.1f}° ~ {max(p.angles[1] for p in self.current_trajectory):.1f}°")
-        self.log(f"   J3范围: {min(p.angles[2] for p in self.current_trajectory):.1f}° ~ {max(p.angles[2] for p in self.current_trajectory):.1f}°")
-        
-        self.btn_start_record.setEnabled(True)
-        self.btn_stop_record.setEnabled(False)
-        self.lbl_record_status.setText(f"状态: 记录完成 | 点数: {len(self.current_trajectory)}")
-    
-    def on_record_point(self, point):
-        """记录点回调（后台线程）"""
-        count = len(self.teach_mode.trajectory)
-        self.lbl_record_status.setText(f"状态: 记录中 | 点数: {count}")
-    
-    def update_live_data(self):
-        """实时更新当前位置，并检查是否接近边界"""
-        if not self.robot.connected:
-            return
-        
-        # 读取当前位置
-        angles = self.robot.get_position()
-        if not angles:
-            return
-        
-        # 检查是否接近边界（示教模式下）
-        if self.btn_exit_teach.isEnabled():  # 在示教模式中
-            from utils.config import JointLimitChecker, JOINT_LIMITS, JOINT_NAMES
-            
-            warnings = []
-            for i, angle in enumerate(angles):
-                min_val, max_val = JOINT_LIMITS[i]
-                # 如果距离边界小于 5 度，给出警告
-                if angle < min_val + 5:
-                    warnings.append(f"{JOINT_NAMES[i]}接近下限({angle:.1f}°)")
-                elif angle > max_val - 5:
-                    warnings.append(f"{JOINT_NAMES[i]}接近上限({angle:.1f}°)")
-            
-            # 如果有警告，每5秒显示一次
-            if warnings:
-                current_time = self._get_time_ms()
-                if not hasattr(self, '_last_warning_time') or \
-                   current_time - self._last_warning_time > 5000:
-                    self.log(f"⚠️ 边界警告: {', '.join(warnings[:2])}")
-                    if len(warnings) > 2:
-                        self.log(f"   还有 {len(warnings)-2} 个关节接近限位")
-                    self._last_warning_time = current_time
-    
-    def _get_time_ms(self):
-        """获取当前时间（毫秒）"""
-        import time
-        return int(time.time() * 1000)
-    
-    def playback_trajectory(self):
-        """回放轨迹"""
+            self.current_trajectory = raw
+
+        self.btn_start_rec.setEnabled(True)
+        self.btn_stop_rec.setEnabled(False)
+        self._update_traj_info()
+
+    def _on_record_point(self, point):
+        """后台线程回调 → 通过 signal 安全转主线程"""
+        self.record_count_signal.emit(len(self.teach_mode.trajectory))
+
+    # ── 回放 ─────────────────────────────────────────────────────────────────
+
+    def _playback(self):
         if not self.current_trajectory:
-            QMessageBox.warning(self, "警告", "请先记录或加载轨迹！")
+            QMessageBox.warning(self, "警告", "没有轨迹数据！请先记录或加载轨迹。")
             return
-        
-        if not self.robot.connected or not self.robot.enabled:
-            QMessageBox.warning(self, "警告", "请先连接并使能机器人！")
+        if not self.robot.connected:
+            QMessageBox.warning(self, "警告", "请先连接机器人！")
             return
-        
-        # 先验证轨迹
-        from utils.config import JointLimitChecker
-        violations = []
-        for idx, point in enumerate(self.current_trajectory):
-            if not JointLimitChecker.is_valid(point.angles):
-                violations.append(idx)
-        
-        if violations:
+        if not self.robot.enabled:
             reply = QMessageBox.question(
-                self, "轨迹验证",
-                f"轨迹中有 {len(violations)} 个点超出关节限位，将自动限制到合法范围。\n"
-                f"是否继续回放？",
+                self, "电机未使能",
+                "电机当前未使能，是否立即使能后开始回放？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.No:
                 return
-        
-        speed = self.speed_slider.value() / 100.0
-        self.log(f"▶️ 开始回放轨迹（速度: {speed}x，点数: {len(self.current_trajectory)}）")
-        
+            if not self.robot.enable():
+                QMessageBox.critical(self, "错误", "使能失败！")
+                return
+
+        speed = self.sld_speed.value() / 100.0
         self.progress_bar.setValue(0)
-        self.btn_playback.setEnabled(False)
-        self.btn_stop_playback.setEnabled(True)
-        
-        self.playback_thread = PlaybackThread(self.robot, self.current_trajectory, speed)
+        self.btn_play.setEnabled(False)
+        self.btn_stop_play.setEnabled(True)
+
+        self.playback_thread = PlaybackThread(
+            self.robot, self.current_trajectory, speed
+        )
         self.playback_thread.progress_signal.connect(self.progress_bar.setValue)
-        self.playback_thread.finished_signal.connect(self.on_playback_finished)
-        self.playback_thread.log_signal.connect(self.log)
+        self.playback_thread.finished_signal.connect(self._on_playback_done)
+        self.playback_thread.log_signal.connect(self._log)
         self.playback_thread.start()
-    
-    def stop_playback(self):
-        """停止回放"""
+
+    def _stop_playback(self):
         if self.playback_thread:
             self.playback_thread.stop()
             self.playback_thread.wait()
-        
-        self.on_playback_finished()
-        self.log("⏹️ 回放已停止")
-    
-    def on_playback_finished(self):
-        """回放完成回调"""
-        self.btn_playback.setEnabled(True)
-        self.btn_stop_playback.setEnabled(False)
-        self.log("✅ 轨迹回放完成")
-    
-    def save_trajectory(self):
-        """保存轨迹"""
+        self._on_playback_done()
+        self._log("回放已停止")
+
+    def _on_playback_done(self):
+        self.btn_play.setEnabled(True)
+        self.btn_stop_play.setEnabled(False)
+        self._log("回放完成")
+
+    # ── 保存 / 加载 ──────────────────────────────────────────────────────────
+
+    def _save(self, fmt: str):
         if not self.current_trajectory:
             QMessageBox.warning(self, "警告", "没有轨迹数据可保存！")
             return
-        
-        # 获取轨迹名称
-        traj_name = self.txt_traj_name.toPlainText().strip()
-        if not traj_name:
-            traj_name = f"轨迹_{datetime.now().strftime('%m%d_%H%M')}"
-        
-        # 选择格式
-        fmt_idx = self.cmb_format.currentIndex()
-        if fmt_idx == 0:  # JSON
-            file_filter = "JSON files (*.json)"
-            default_ext = ".json"
-            save_format = 'json'
-        else:  # CSV
-            file_filter = "CSV files (*.csv)"
-            default_ext = ".csv"
-            save_format = 'csv'
-        
-        # 选择保存路径
-        default_path = os.path.expanduser(f"~/Desktop/{traj_name}{default_ext}")
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "保存轨迹", default_path, file_filter
+        ext = '.json' if fmt == 'json' else '.csv'
+        filt = f"{'JSON' if fmt=='json' else 'CSV'} files (*{ext})"
+        default = os.path.expanduser(
+            f"~/Desktop/轨迹_{datetime.now().strftime('%m%d_%H%M')}{ext}"
         )
-        
-        if not filepath:
+        path, _ = QFileDialog.getSaveFileName(self, "保存轨迹", default, filt)
+        if not path:
             return
-        
         try:
-            metadata = {
-                'name': traj_name,
-                'description': f'Dummy V2示教轨迹 - {datetime.now().strftime("%Y-%m-%d %H:%M")}',
-                'joint_limits': 'J3 min=35° (firmware limit)',
-                'sample_interval': self.sample_spin.value(),
-                'smoothed': self.chk_auto_smooth.isChecked()
-            }
-            
             self.teach_mode.save_trajectory(
-                self.current_trajectory,
-                filepath,
-                format=save_format,
-                metadata=metadata
+                self.current_trajectory, path, format=fmt,
+                metadata={'created': datetime.now().isoformat()}
             )
-            
-            self.log(f"💾 轨迹已保存: {filepath}")
-            QMessageBox.information(self, "成功", f"轨迹已保存到:\n{filepath}")
-        
+            self._log(f"已保存: {path}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败:\n{e}")
-    
-    def load_trajectory(self):
-        """加载轨迹"""
-        filepath, _ = QFileDialog.getOpenFileName(
+
+    def _load(self):
+        path, _ = QFileDialog.getOpenFileName(
             self, "加载轨迹", os.path.expanduser("~/Desktop"),
             "Trajectory files (*.json *.csv)"
         )
-        
-        if not filepath:
+        if not path:
             return
-        
         try:
-            if filepath.endswith('.json'):
-                self.current_trajectory = self.teach_mode.load_trajectory(filepath)
+            if path.endswith('.json'):
+                traj = self.teach_mode.load_trajectory(path)
             else:
-                # 从CSV加载
-                self.current_trajectory = self.load_csv_trajectory(filepath)
-            
-            if self.current_trajectory:
-                self.log(f"📂 轨迹加载完成: {len(self.current_trajectory)} 点")
-                self.lbl_record_status.setText(f"状态: 已加载 | 点数: {len(self.current_trajectory)}")
-                QMessageBox.information(self, "成功", f"轨迹加载完成:\n{len(self.current_trajectory)} 个轨迹点")
+                traj = self._load_csv(path)
+            if traj:
+                self.current_trajectory = traj
+                self._update_traj_info()
+                self._log(f"加载完成: {len(traj)} 点")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载失败:\n{e}")
-    
-    def load_csv_trajectory(self, filepath):
-        """从CSV加载轨迹"""
+
+    def _load_csv(self, path):
         import csv
         from core.teach_mode import TrajectoryPoint
-        
-        trajectory = []
-        with open(filepath, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            for row in reader:
+        result = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for row in csv.reader(f):
                 if not row or row[0].startswith('#') or row[0] == 'timestamp':
                     continue
-                trajectory.append(TrajectoryPoint(
+                result.append(TrajectoryPoint(
                     timestamp=float(row[0]),
                     angles=[float(x) for x in row[1:7]]
                 ))
-        return trajectory
-    
-    def log(self, msg):
-        """添加日志"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.txt_log.append(f"[{timestamp}] {msg}")
-    
+        return result
+
+    # ── 工具 ─────────────────────────────────────────────────────────────────
+
+    def _update_traj_info(self):
+        traj = self.current_trajectory
+        if not traj:
+            self.lbl_traj_info.setText("无轨迹")
+            return
+        dur = traj[-1].timestamp if traj else 0
+        self.lbl_traj_info.setText(
+            f"{len(traj)} 点 | 时长 {dur:.1f}s | "
+            f"点间隔 {dur/(len(traj)-1)*1000:.0f}ms"
+            if len(traj) > 1 else f"{len(traj)} 点"
+        )
+        self.lbl_record_status.setText(f"已记录 {len(traj)} 点")
+
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.txt_log.append(f"[{ts}] {msg}")
+
     def closeEvent(self, event):
-        """关闭时清理"""
+        self.status_timer.stop()
         if self.recording:
-            self.stop_recording()
+            self._stop_recording()
         if self.playback_thread and self.playback_thread.isRunning():
             self.playback_thread.stop()
             self.playback_thread.wait()
-        
-        # 如果还在示教模式，退出
-        if self.btn_exit_teach.isEnabled():
-            self.exit_teach_mode()
-        
+        if self.in_teach_mode:
+            self.robot.exit_teach_mode()
         event.accept()

@@ -5,7 +5,7 @@ from typing import List, Tuple
 
 # 串口配置
 DEFAULT_BAUDRATE = 115200
-DEFAULT_PORT = "/dev/ttyACM0"
+DEFAULT_PORT = "/dev/ttyACM2"
 
 # 关节配置
 JOINT_NAMES = [
@@ -20,15 +20,14 @@ JOINT_NAMES = [
 JOINT_LIMITS = [
     (-170, 170),   # J1
     (-75, 0),      # J2
-    (35, 180),     # J3 - 固件硬编码限制，最小35°
+    (0, 180),      # J3 - 软件限制，0°=link3竖直，无自碰撞风险
     (-170, 170),   # J4
     (-120, 120),   # J5
     (-720, 720),   # J6
 ]
 
 # 预设位置
-# 坐标系: J2=-75~0 (折叠→垂直), J3=35~180 (固件硬编码限制)
-# 注意: J3最小35°(固件限制), 不能到0°
+# 坐标系: J2=-75~0 (折叠→垂直), J3=0~180 (0°=link3竖直/伸直)
 POSES = {
     "REST (折叠)": [0, -75, 180, 0, 0, 0],
     "L-Pose": [0, 0, 90, 0, 0, 0],
@@ -126,7 +125,7 @@ class JointLimitChecker:
         for i, a in enumerate(angles):
             min_val, max_val = JOINT_LIMITS[i]
             if a < min_val or a > max_val:
-                violations.append((i, a, min_val, max_limit))
+                violations.append((i, a, min_val, max_val))
         return violations
     
     @classmethod

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
-from gui.main_window import MainWindow
+from gui.main_window_with_mujoco import MainWindowWithMuJoCo
 
 
 def main():
@@ -20,13 +20,13 @@ def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
-    
+
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    
-    window = MainWindow()
+
+    window = MainWindowWithMuJoCo()
     window.show()
-    
+
     sys.exit(app.exec())
 
 

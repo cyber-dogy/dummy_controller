@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 import numpy as np
 
+from core.gripper import normalize_gripper_value
+
 
 # ── 回放线程 ────────────────────────────────────────────────────────────────
 
@@ -36,12 +38,24 @@ class PlaybackThread(QThread):
         n = len(traj)
         self.log_signal.emit(f"开始回放 {n} 个点，速度 {self.speed_ratio:.1f}x")
 
+        last_gripper = None
         for idx, point in enumerate(traj):
             if self.stopped:
                 break
-            ok, msg = self.robot.move_to(point.angles, check_limits=False)
+            target_angles = point.playback_angles() if hasattr(point, "playback_angles") else point.angles
+            ok, msg = self.robot.move_to(target_angles, check_limits=False)
             if not ok:
                 self.log_signal.emit(f"第 {idx} 点发送失败: {msg}")
+
+            if hasattr(self.robot, "set_gripper_state"):
+                target_gripper = normalize_gripper_value(
+                    point.playback_gripper() if hasattr(point, "playback_gripper") else getattr(point, "gripper", 0.0)
+                )
+                if idx == 0 or abs(target_gripper - last_gripper) >= 1e-6:
+                    self.robot.set_gripper_state(target_gripper)
+                    last_gripper = target_gripper
+                elif target_gripper < 0.5 and hasattr(self.robot, "refresh_gripper_hold"):
+                    self.robot.refresh_gripper_hold()
 
             if idx < n - 1:
                 dt = (traj[idx + 1].timestamp - point.timestamp) / self.speed_ratio
@@ -369,6 +383,7 @@ class TeachDialog(QDialog):
         self.teach_mode.sample_interval = self.spin_interval.value()
         self.teach_mode.start_recording()
         self.recording = True
+        self.robot.set_runtime_state("recording", True)
 
         self.btn_start_rec.setEnabled(False)
         self.btn_stop_rec.setEnabled(True)
@@ -379,6 +394,7 @@ class TeachDialog(QDialog):
         if not self.teach_mode:
             return
         self.recording = False
+        self.robot.set_runtime_state("recording", False)
         raw = self.teach_mode.stop_recording()
         self._log(f"停止记录，原始点数: {len(raw)}")
 
@@ -432,6 +448,7 @@ class TeachDialog(QDialog):
         self.playback_thread.progress_signal.connect(self.progress_bar.setValue)
         self.playback_thread.finished_signal.connect(self._on_playback_done)
         self.playback_thread.log_signal.connect(self._log)
+        self.robot.set_runtime_state("playback", True)
         self.playback_thread.start()
 
     def _stop_playback(self):
@@ -442,6 +459,7 @@ class TeachDialog(QDialog):
         self._log("回放已停止")
 
     def _on_playback_done(self):
+        self.robot.set_runtime_state("playback", False)
         self.btn_play.setEnabled(True)
         self.btn_stop_play.setEnabled(False)
         self._log("回放完成")
@@ -477,30 +495,13 @@ class TeachDialog(QDialog):
         if not path:
             return
         try:
-            if path.endswith('.json'):
-                traj = self.teach_mode.load_trajectory(path)
-            else:
-                traj = self._load_csv(path)
+            traj = self.teach_mode.load_trajectory(path)
             if traj:
                 self.current_trajectory = traj
                 self._update_traj_info()
                 self._log(f"加载完成: {len(traj)} 点")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载失败:\n{e}")
-
-    def _load_csv(self, path):
-        import csv
-        from core.teach_mode import TrajectoryPoint
-        result = []
-        with open(path, 'r', encoding='utf-8') as f:
-            for row in csv.reader(f):
-                if not row or row[0].startswith('#') or row[0] == 'timestamp':
-                    continue
-                result.append(TrajectoryPoint(
-                    timestamp=float(row[0]),
-                    angles=[float(x) for x in row[1:7]]
-                ))
-        return result
 
     # ── 工具 ─────────────────────────────────────────────────────────────────
 

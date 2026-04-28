@@ -13,6 +13,9 @@ from typing import List, Dict, Optional, Callable, Tuple
 from dataclasses import dataclass, asdict
 import threading
 
+from core.kinematics import DummyKinematics
+from core.gripper import normalize_gripper_value
+
 
 @dataclass
 class TrajectoryPoint:
@@ -21,14 +24,41 @@ class TrajectoryPoint:
     angles: List[float]       # 6轴角度 [J1, J2, J3, J4, J5, J6]
     velocity: Optional[List[float]] = None  # 速度（可选）
     acceleration: Optional[List[float]] = None  # 加速度（可选）
-    
+    playback_speed: Optional[int] = None  # 回放关节速度（度/秒）
+    target_angles: Optional[List[float]] = None  # 目标角度（GUI 实时跟随录制时）
+    gripper: float = 0.0      # 当前夹爪角度
+    target_gripper: Optional[float] = None  # 目标夹爪角度
+    source: str = "teach"     # 数据来源
+
     def to_dict(self):
         return {
             'timestamp': self.timestamp,
             'angles': self.angles,
             'velocity': self.velocity,
-            'acceleration': self.acceleration
+            'acceleration': self.acceleration,
+            'playback_speed': self.playback_speed,
+            'target_angles': self.target_angles,
+            'gripper': normalize_gripper_value(self.gripper),
+            'target_gripper': (
+                normalize_gripper_value(self.target_gripper)
+                if self.target_gripper is not None
+                else None
+            ),
+            'source': self.source,
         }
+
+    def playback_angles(self) -> List[float]:
+        """回放优先使用目标轨迹；没有目标时退回观测轨迹。"""
+        return list(self.target_angles if self.target_angles is not None else self.angles)
+
+    def playback_gripper(self) -> float:
+        return normalize_gripper_value(
+            self.target_gripper if self.target_gripper is not None else self.gripper
+        )
+
+    def playback_speed_value(self, default_speed: int = 30) -> int:
+        speed = self.playback_speed if self.playback_speed is not None else default_speed
+        return max(1, int(speed))
 
 
 class TeachMode:
@@ -44,6 +74,9 @@ class TeachMode:
         self.record_thread = None
         self.sample_interval = self.DEFAULT_SAMPLE_INTERVAL
         self.on_record_callback: Optional[Callable] = None
+        self._action_provider: Optional[Callable[[], Optional[Dict[str, object]]]] = None
+        self._record_source = "teach"
+        self.kinematics = DummyKinematics()
         
     def enter_teach_mode(self, current_limit: float = 0.5) -> bool:
         """
@@ -60,12 +93,28 @@ class TeachMode:
     def exit_teach_mode(self) -> bool:
         """退出示教模式，恢复位置控制"""
         return self.robot.exit_teach_mode()
+
+    def set_tcp_offset_mm(self, offset_mm: float):
+        self.kinematics.set_tcp_offset_mm(offset_mm)
+
+    def get_tcp_offset_mm(self) -> float:
+        return self.kinematics.get_tcp_offset_mm()
+
+    def set_world_settings(self, settings: Dict[str, object]):
+        self.kinematics.set_world_settings(settings)
+
+    def get_world_settings(self) -> Dict[str, object]:
+        return self.kinematics.get_world_settings()
     
-    def start_recording(self):
+    def start_recording(self,
+                        action_provider: Optional[Callable[[], Optional[Dict[str, object]]]] = None,
+                        source: str = "teach"):
         """开始记录轨迹"""
         if self.recording:
             return
         
+        self._action_provider = action_provider
+        self._record_source = source
         self.recording = True
         self.trajectory = []
         self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
@@ -91,9 +140,31 @@ class TeachMode:
 
                 if angles:
                     consecutive_errors = 0
+                    obs_gripper = normalize_gripper_value(
+                        self.robot.get_gripper() if hasattr(self.robot, "get_gripper") else 0.0
+                    )
+                    target_angles = None
+                    target_gripper = None
+
+                    if self._action_provider:
+                        try:
+                            action_payload = self._action_provider() or {}
+                            payload_angles = action_payload.get("angles")
+                            if payload_angles is not None:
+                                target_angles = list(payload_angles[:6])
+                            payload_gripper = action_payload.get("gripper")
+                            if payload_gripper is not None:
+                                target_gripper = normalize_gripper_value(payload_gripper)
+                        except Exception as exc:
+                            print(f"[示教] 读取 action_provider 失败: {exc}")
+
                     point = TrajectoryPoint(
                         timestamp=t0 - start_time,
-                        angles=angles
+                        angles=angles,
+                        target_angles=target_angles,
+                        gripper=normalize_gripper_value(obs_gripper),
+                        target_gripper=target_gripper,
+                        source=self._record_source,
                     )
                     self.trajectory.append(point)
 
@@ -123,6 +194,19 @@ class TeachMode:
             sleep_time = self.sample_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    def _nearest_gripper_pair(self, trajectory: List[TrajectoryPoint], timestamp: float) -> Tuple[float, Optional[float]]:
+        if not trajectory:
+            return 0.0, None
+        nearest = min(trajectory, key=lambda p: abs(float(p.timestamp) - float(timestamp)))
+        return (
+            normalize_gripper_value(nearest.gripper),
+            (
+                normalize_gripper_value(nearest.target_gripper)
+                if nearest.target_gripper is not None
+                else None
+            ),
+        )
     
     def smooth_trajectory_adaptive(self, trajectory: List[TrajectoryPoint],
                                    strength: int = 5) -> List[TrajectoryPoint]:
@@ -188,13 +272,24 @@ class TeachMode:
                 float(np.interp(t, times, smoothed_angles[:, j]))
                 for j in range(6)
             ]
-            result.append(TrajectoryPoint(timestamp=float(t), angles=interp_angles))
+            gripper, target_gripper = self._nearest_gripper_pair(deduped, float(t))
+            result.append(TrajectoryPoint(
+                timestamp=float(t),
+                angles=interp_angles,
+                gripper=gripper,
+                target_gripper=target_gripper,
+                source=deduped[0].source,
+            ))
 
         # 补上最后一个点（避免截断）
         if result[-1].timestamp < times[-1] - 0.01:
+            gripper, target_gripper = self._nearest_gripper_pair(deduped, float(times[-1]))
             result.append(TrajectoryPoint(
                 timestamp=float(times[-1]),
-                angles=smoothed_angles[-1].tolist()
+                angles=smoothed_angles[-1].tolist(),
+                gripper=gripper,
+                target_gripper=target_gripper,
+                source=deduped[-1].source,
             ))
 
         return result
@@ -220,7 +315,16 @@ class TeachMode:
                     timestamp=p.timestamp,
                     angles=JointLimitChecker.clamp_angles(p.angles),
                     velocity=p.velocity,
-                    acceleration=p.acceleration
+                    acceleration=p.acceleration,
+                    playback_speed=p.playback_speed,
+                    target_angles=p.target_angles,
+                    gripper=normalize_gripper_value(p.gripper),
+                    target_gripper=(
+                        normalize_gripper_value(p.target_gripper)
+                        if p.target_gripper is not None
+                        else None
+                    ),
+                    source=p.source,
                 )
                 for p in trajectory
             ]
@@ -246,7 +350,16 @@ class TeachMode:
                 timestamp=point.timestamp,
                 angles=clamped_angles,
                 velocity=point.velocity,
-                acceleration=point.acceleration
+                acceleration=point.acceleration,
+                playback_speed=point.playback_speed,
+                target_angles=point.target_angles,
+                gripper=normalize_gripper_value(point.gripper),
+                target_gripper=(
+                    normalize_gripper_value(point.target_gripper)
+                    if point.target_gripper is not None
+                    else None
+                ),
+                source=point.source,
             ))
         
         return smoothed
@@ -269,7 +382,16 @@ class TeachMode:
             return [
                 TrajectoryPoint(
                     timestamp=p.timestamp,
-                    angles=JointLimitChecker.clamp_angles(p.angles)
+                    angles=JointLimitChecker.clamp_angles(p.angles),
+                    playback_speed=p.playback_speed,
+                    target_angles=p.target_angles,
+                    gripper=normalize_gripper_value(p.gripper),
+                    target_gripper=(
+                        normalize_gripper_value(p.target_gripper)
+                        if p.target_gripper is not None
+                        else None
+                    ),
+                    source=p.source,
                 )
                 for p in trajectory
             ]
@@ -296,9 +418,13 @@ class TeachMode:
             clamped_angles = JointLimitChecker.clamp_angles(
                 new_angles[idx].tolist()
             )
+            gripper, target_gripper = self._nearest_gripper_pair(trajectory, float(t))
             interpolated.append(TrajectoryPoint(
                 timestamp=t,
-                angles=clamped_angles
+                angles=clamped_angles,
+                gripper=gripper,
+                target_gripper=target_gripper,
+                source=trajectory[0].source,
             ))
         
         return interpolated
@@ -374,7 +500,16 @@ class TeachMode:
             idx = np.argmin(np.linalg.norm(points - angles, axis=1))
             result.append(TrajectoryPoint(
                 timestamp=trajectory[idx].timestamp,
-                angles=angles.tolist()
+                angles=angles.tolist(),
+                playback_speed=trajectory[idx].playback_speed,
+                target_angles=trajectory[idx].target_angles,
+                gripper=normalize_gripper_value(trajectory[idx].gripper),
+                target_gripper=(
+                    normalize_gripper_value(trajectory[idx].target_gripper)
+                    if trajectory[idx].target_gripper is not None
+                    else None
+                ),
+                source=trajectory[idx].source,
             ))
         
         return result
@@ -449,13 +584,23 @@ class TeachMode:
             format: 格式 ('json' 或 'csv')
             metadata: 元数据（名称、描述等）
         """
+        metadata = metadata or {}
         data = {
-            'metadata': metadata or {},
+            'metadata': {
+                **metadata,
+                'schema_version': 'dummy_lerobot_ready_v1',
+                'state_encoding': 'xyz_mm + rot6d(6) + binary_gripper_open',
+                'action_encoding': 'xyz_mm + rot6d(6) + binary_gripper_open',
+                'gripper_encoding': '0.0=closed/clamped, 1.0=open',
+                'kinematics_available': self.kinematics.available,
+                'tcp_offset_mm': self.kinematics.get_tcp_offset_mm(),
+                'world_settings': self.kinematics.get_world_settings(),
+            },
             'created_at': datetime.now().isoformat(),
             'duration': trajectory[-1].timestamp if trajectory else 0,
             'num_points': len(trajectory),
             'joint_names': ['J1', 'J2', 'J3', 'J4', 'J5', 'J6'],
-            'trajectory': [p.to_dict() for p in trajectory]
+            'trajectory': [self._serialize_point(p) for p in trajectory]
         }
         
         if format == 'json':
@@ -463,21 +608,41 @@ class TeachMode:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         
         elif format == 'csv':
-            # CSV格式便于ML训练
             with open(filepath, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                # 写入元数据注释
-                writer.writerow(['# Dummy Robot Trajectory'])
+                writer.writerow(['# Dummy Robot Trajectory (LeRobot-ready)'])
                 writer.writerow([f'# Created: {data["created_at"]}'])
                 writer.writerow([f'# Duration: {data["duration"]:.3f}s'])
                 writer.writerow([f'# Points: {data["num_points"]}'])
+                writer.writerow(['# observation.state/action = [x_mm, y_mm, z_mm, rot6d(6), gripper_open_binary]'])
                 writer.writerow([])
-                # 写入表头
-                writer.writerow(['timestamp', 'J1', 'J2', 'J3', 'J4', 'J5', 'J6'])
-                # 写入数据
+                header = (
+                    ['timestamp', 'source', 'playback_speed', 'observation.gripper', 'action.gripper']
+                    + [f'observation.joint.J{i+1}' for i in range(6)]
+                    + [f'action.joint.J{i+1}' for i in range(6)]
+                    + [f'observation.state.{i}' for i in range(10)]
+                    + [f'action.{i}' for i in range(10)]
+                )
+                writer.writerow(header)
                 for p in trajectory:
-                    writer.writerow([f'{p.timestamp:.6f}'] + [f'{a:.4f}' for a in p.angles])
-    
+                    row = self._serialize_point(p)
+                    obs_state = row.get('observation.state') or [None] * 10
+                    action_state = row.get('action') or [None] * 10
+                    action_angles = row.get('action.joints') or row['angles']
+                    action_gripper = row.get('target_gripper')
+                    if action_gripper is None:
+                        action_gripper = row.get('gripper', 0.0)
+                    writer.writerow(
+                        [f'{p.timestamp:.6f}', row.get('source', 'teach'),
+                         row.get('playback_speed') or '',
+                         f"{row.get('gripper', 0.0):.4f}",
+                         f"{float(action_gripper):.4f}"]
+                        + [f'{a:.4f}' for a in row['angles']]
+                        + [f'{a:.4f}' for a in action_angles]
+                        + [self._fmt_csv_value(v) for v in obs_state]
+                        + [self._fmt_csv_value(v) for v in action_state]
+                    )
+
     def load_trajectory(self, filepath: str, 
                        validate_limits: bool = True) -> Optional[List[TrajectoryPoint]]:
         """
@@ -493,6 +658,9 @@ class TeachMode:
         from utils.config import JointLimitChecker
         
         try:
+            if filepath.lower().endswith('.csv'):
+                return self._load_csv_trajectory(filepath, validate_limits=validate_limits)
+
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
@@ -500,7 +668,18 @@ class TeachMode:
             violations_count = 0
             
             for p in data['trajectory']:
-                angles = p['angles']
+                angles = p.get('angles') or p.get('observation.joints')
+                if angles is None:
+                    continue
+                target_angles = p.get('target_angles') or p.get('action.joints')
+                gripper = self._extract_gripper_value(
+                    p.get('gripper'),
+                    p.get('observation.state'),
+                )
+                target_gripper = self._extract_gripper_value(
+                    p.get('target_gripper'),
+                    p.get('action'),
+                )
                 
                 # 验证并限制角度
                 if validate_limits:
@@ -508,12 +687,19 @@ class TeachMode:
                     if not JointLimitChecker.is_valid(angles):
                         violations_count += 1
                     angles = clamped_angles
+                    if target_angles is not None:
+                        target_angles = JointLimitChecker.clamp_angles(target_angles)
                 
                 trajectory.append(TrajectoryPoint(
                     timestamp=p['timestamp'],
                     angles=angles,
                     velocity=p.get('velocity'),
-                    acceleration=p.get('acceleration')
+                    acceleration=p.get('acceleration'),
+                    playback_speed=p.get('playback_speed'),
+                    target_angles=target_angles,
+                    gripper=normalize_gripper_value(gripper),
+                    target_gripper=normalize_gripper_value(target_gripper),
+                    source=p.get('source', 'loaded'),
                 ))
             
             if violations_count > 0:
@@ -567,7 +753,16 @@ class TeachMode:
                 timestamp=p.timestamp,
                 angles=JointLimitChecker.clamp_angles(p.angles),
                 velocity=p.velocity,
-                acceleration=p.acceleration
+                acceleration=p.acceleration,
+                playback_speed=p.playback_speed,
+                target_angles=p.target_angles,
+                gripper=normalize_gripper_value(p.gripper),
+                target_gripper=(
+                    normalize_gripper_value(p.target_gripper)
+                    if p.target_gripper is not None
+                    else None
+                ),
+                source=p.source,
             )
             for p in trajectory
         ]
@@ -582,7 +777,12 @@ class TeachMode:
                     timestamp=fixed[i].timestamp,
                     angles=smoothed_angles[i],
                     velocity=fixed[i].velocity,
-                    acceleration=fixed[i].acceleration
+                    acceleration=fixed[i].acceleration,
+                    playback_speed=fixed[i].playback_speed,
+                    target_angles=fixed[i].target_angles,
+                    gripper=fixed[i].gripper,
+                    target_gripper=fixed[i].target_gripper,
+                    source=fixed[i].source,
                 )
                 for i in range(len(fixed))
             ]
@@ -623,7 +823,15 @@ class TeachMode:
                     violations_total += 1
                 valid_trajectory.append(TrajectoryPoint(
                     timestamp=point.timestamp,
-                    angles=clamped
+                    angles=clamped,
+                    target_angles=point.target_angles,
+                    gripper=normalize_gripper_value(point.gripper),
+                    target_gripper=(
+                        normalize_gripper_value(point.target_gripper)
+                        if point.target_gripper is not None
+                        else None
+                    ),
+                    source=point.source,
                 ))
             
             if violations_total > 0:
@@ -641,6 +849,7 @@ class TeachMode:
         last_tx_time = 0
         tx_count = 0
         skip_count = 0
+        last_gripper: Optional[float] = None
         
         print(f"[CAN回放] 开始回放 {len(trajectory)} 点，速度 {speed_ratio}x")
         
@@ -655,22 +864,31 @@ class TeachMode:
             # 如果是第一个点，进行平滑过渡
             if idx == 0 and current_pos:
                 # 检查是否需要插入过渡点
-                max_diff = max(abs(a - b) for a, b in zip(point.angles, current_pos))
+                playback_angles = point.playback_angles()
+                max_diff = max(abs(a - b) for a, b in zip(playback_angles, current_pos))
                 if max_diff > 10:  # 如果差距大于10度，插入过渡
                     transition = JointLimitChecker.interpolate_to_limit(
-                        current_pos, point.angles, steps=5
+                        current_pos, playback_angles, steps=5
                     )
                     for t_angles in transition[:-1]:  # 不执行最后一个点（会被下面执行）
                         self.robot.move_to(t_angles, check_limits=False)
                         time.sleep(0.05)
             
             # 运动到目标点
-            success, msg = self.robot.move_to(point.angles, check_limits=False)
+            success, msg = self.robot.move_to(point.playback_angles(), check_limits=False)
             if not success:
                 self.stats['can_errors'] += 1
                 print(f"[警告] 第 {idx} 点发送失败: {msg}")
             else:
                 tx_count += 1
+
+            if hasattr(self.robot, "set_gripper_state"):
+                target_gripper = normalize_gripper_value(point.playback_gripper())
+                if last_gripper is None or abs(last_gripper - target_gripper) >= 1e-6:
+                    self.robot.set_gripper_state(target_gripper)
+                    last_gripper = target_gripper
+                elif target_gripper < 0.5 and hasattr(self.robot, "refresh_gripper_hold"):
+                    self.robot.refresh_gripper_hold()
             
             last_tx_time = time.time()
             
@@ -689,3 +907,97 @@ class TeachMode:
         print(f"[CAN回放] 完成: 发送 {tx_count} 点, 跳过 {skip_count} 点")
         if skip_count > 0:
             print(f"[CAN回放] 提示: 跳过的点过多，建议降低回放速度或减少轨迹点数")
+
+    def _serialize_point(self, point: TrajectoryPoint) -> Dict[str, object]:
+        action_angles = point.playback_angles()
+        gripper = normalize_gripper_value(point.gripper)
+        action_gripper = normalize_gripper_value(point.playback_gripper())
+        obs_pose = self.kinematics.compute_pose(point.angles, gripper)
+        action_pose = self.kinematics.compute_pose(action_angles, action_gripper)
+
+        return {
+            'timestamp': float(point.timestamp),
+            'source': point.source,
+            'angles': [float(a) for a in point.angles],
+            'target_angles': [float(a) for a in point.target_angles] if point.target_angles is not None else None,
+            'gripper': gripper,
+            'target_gripper': action_gripper if point.target_gripper is not None else None,
+            'velocity': point.velocity,
+            'acceleration': point.acceleration,
+            'playback_speed': point.playback_speed,
+            'observation.joints': [float(a) for a in point.angles],
+            'action.joints': [float(a) for a in action_angles],
+            'observation.state': obs_pose.state_vector() if obs_pose else None,
+            'action': action_pose.state_vector() if action_pose else None,
+            'observation.eef': obs_pose.to_dict() if obs_pose else None,
+            'action.eef': action_pose.to_dict() if action_pose else None,
+        }
+
+    def _load_csv_trajectory(self, filepath: str, validate_limits: bool = True) -> Optional[List[TrajectoryPoint]]:
+        from utils.config import JointLimitChecker
+
+        rows: List[TrajectoryPoint] = []
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(
+                line for line in f
+                if line.strip() and not self._is_csv_comment_line(line)
+            )
+
+            for row in reader:
+                if not row:
+                    continue
+
+                if 'observation.joint.J1' in row:
+                    angles = [float(row[f'observation.joint.J{i+1}']) for i in range(6)]
+                    target_angles = [
+                        float(row.get(f'action.joint.J{i+1}') or row[f'observation.joint.J{i+1}'])
+                        for i in range(6)
+                    ]
+                    playback_speed = int(float(row.get('playback_speed') or 0)) or None
+                    gripper = normalize_gripper_value(row.get('observation.gripper') or 0.0)
+                    target_gripper = normalize_gripper_value(row.get('action.gripper') or gripper)
+                    source = row.get('source') or 'loaded_csv'
+                else:
+                    angles = [float(row[f'J{i+1}']) for i in range(6)]
+                    target_angles = None
+                    playback_speed = None
+                    gripper = 0.0
+                    target_gripper = None
+                    source = 'legacy_csv'
+
+                if validate_limits:
+                    angles = JointLimitChecker.clamp_angles(angles)
+                    if target_angles is not None:
+                        target_angles = JointLimitChecker.clamp_angles(target_angles)
+
+                rows.append(TrajectoryPoint(
+                    timestamp=float(row['timestamp']),
+                    angles=angles,
+                    playback_speed=playback_speed,
+                    target_angles=target_angles,
+                    gripper=normalize_gripper_value(gripper),
+                    target_gripper=(
+                        normalize_gripper_value(target_gripper)
+                        if target_gripper is not None
+                        else None
+                    ),
+                    source=source,
+                ))
+
+        return rows
+
+    def _extract_gripper_value(self, direct_value, state_vector) -> float:
+        if direct_value is not None:
+            return normalize_gripper_value(direct_value)
+        if isinstance(state_vector, list) and len(state_vector) >= 10:
+            return normalize_gripper_value(state_vector[9])
+        return 0.0
+
+    def _fmt_csv_value(self, value) -> str:
+        if value is None:
+            return ''
+        return f'{float(value):.6f}'
+
+    def _is_csv_comment_line(self, line: str) -> bool:
+        stripped = line.lstrip()
+        return stripped.startswith('#') or stripped.startswith('"#')

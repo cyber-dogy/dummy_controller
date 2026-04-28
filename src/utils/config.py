@@ -17,22 +17,37 @@ JOINT_NAMES = [
     "J6 末端"
 ]
 
+# 当前已烧录的线轨夹爪 rtx-50 固件事实:
+#   motorJ[1] = CtrlStepMotor(..., 50, -170, 170)
+#   motorJ[2] = CtrlStepMotor(..., 50, -75, 90)
+#   motorJ[3] = CtrlStepMotor(..., 50, 35, 180)
+#   motorJ[4] = CtrlStepMotor(..., 50, -180, 180)
+#   motorJ[5] = CtrlStepMotor(..., 50, -120, 120)
+#   motorJ[6] = CtrlStepMotor(..., 50, -180, 180)
 JOINT_LIMITS = [
     (-170, 170),   # J1
-    (-75, 0),      # J2
-    (0, 180),      # J3 - 软件限制，0°=link3竖直，无自碰撞风险
-    (-170, 170),   # J4
+    (-75, 90),     # J2
+    (35, 180),     # J3 - 固件硬限位，0-35°固件不可达，最小安全值 35°
+    (-180, 180),   # J4
     (-120, 120),   # J5
-    (-720, 720),   # J6
+    (-180, 180),   # J6 - 当前线轨夹爪固件限制
 ]
 
 # 预设位置
-# 坐标系: J2=-75~0 (折叠→垂直), J3=0~180 (0°=link3竖直/伸直)
+# 坐标系: J2=-75~90, J3=35~180 (0°=link3竖直/伸直，但当前固件不可达)
+RESET_POSE = [0, -75, 180, 0, 0, 0]  # 固件 !RESET / Resting()
+HOME_POSE = [0, 0, 90, 0, 0, 0]      # 固件 !HOME / Homing()
+
 POSES = {
-    "REST (折叠)": [0, -75, 180, 0, 0, 0],
-    "L-Pose": [0, 0, 90, 0, 0, 0],
-    "垂直向上": [0, 0, 35, 0, 0, 0],  # J3=35° 是固件允许的最小角度
+    "RESET (固件折叠位)": RESET_POSE,
+    "HOME (固件L位)": HOME_POSE,
+    "垂直向上": [0, 0, 35, 0, 0, 0],  # J3=35° 固件硬限位最小值
 }
+
+# J6 当前已刷固件按 50:1 计算电机步数，实际末端机械减速器为 mini8-30。
+# 真实输出角 = 固件角 * J6_FIRMWARE_REDUCTION / J6_OUTPUT_REDUCTION_DEFAULT。
+J6_FIRMWARE_REDUCTION = 50.0
+J6_OUTPUT_REDUCTION_DEFAULT = 30.0
 
 # 颜色主题
 COLORS = {

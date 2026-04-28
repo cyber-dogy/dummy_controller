@@ -53,10 +53,10 @@
                range="-3.001966 3.001966" damping="2"/>
         <geom name="link1_geom" mesh="link1_mesh" pos="0 0 -0.096" material="robot"/>
 
-        <!-- Joint 2: 肩部  axis=+X  range=[-90°,75°] -->
+        <!-- Joint 2: 肩部  axis=+X  range=[-75°,170°] -->
         <body name="link2" pos="-0.011639 0.034477 0.0285">
           <joint name="joint2" type="hinge" axis="1 0 0"
-                 range="-1.570796 1.308997" damping="2"/>
+                 range="-1.308997 2.967060" damping="2"/>
           <geom name="link2_geom" mesh="link2_mesh"
                 pos="0.011639 -0.034477 -0.1245" material="robot"/>
 
@@ -127,7 +127,7 @@
     <position name="joint1_ctrl" joint="joint1" kp="500" kv="50"
               ctrlrange="-3.001966 3.001966"/>
     <position name="joint2_ctrl" joint="joint2" kp="500" kv="50"
-              ctrlrange="-1.570796 1.308997"/>
+              ctrlrange="-1.308997 2.967060"/>
     <position name="joint3_ctrl" joint="joint3" kp="500" kv="50"
               ctrlrange="-1.500983 1.570796"/>
     <position name="joint4_ctrl" joint="joint4" kp="300" kv="30"
@@ -150,6 +150,8 @@
     <jointpos name="joint4_pos" joint="joint4"/>
     <jointpos name="joint5_pos" joint="joint5"/>
     <jointpos name="joint6_pos" joint="joint6"/>
+    <jointpos name="figer1_pos" joint="figer1"/>
+    <jointpos name="figer2_pos" joint="figer2"/>
     <framepos  name="end_effector_pos"  objtype="site" objname="end_effector"/>
     <framequat name="end_effector_quat" objtype="site" objname="end_effector"/>
   </sensor>

@@ -16,13 +16,20 @@ pip install -r requirements.txt
 ## 运行
 
 ```bash
-python -m src.main
+python src/main.py
 ```
 
 或
 
 ```bash
-cd src && python main.py
+python -m src.main
+```
+
+如果项目使用内置 MuJoCo 环境：
+
+```bash
+source mujoco_sim/.venv_mujoco/bin/activate
+python scripts/verify_baseline.py
 ```
 
 ## 功能
@@ -32,3 +39,6 @@ cd src && python main.py
 - 实时位置反馈
 - 串口自动检测
 - 紧急停止保护
+- MuJoCo 主视图 + ghost 影子预览
+- 数值 IK
+- 仿真轨迹录制 / 保存 / 加载 / 回放
